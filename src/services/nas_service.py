@@ -2,6 +2,7 @@ import logging
 import shutil
 from pathlib import Path
 from typing import Optional
+
 from config.settings import settings
 
 
@@ -18,12 +19,12 @@ class NasService:
         self.organizer_columns = settings.nas.organizer_columns
 
     # ------------------------------------------------------------------
-    # Utilitários
+    # Construção de caminhos
     # ------------------------------------------------------------------
 
     def build_product_path(self, data_row: dict, product_id: int) -> Path:
         """
-        Monta o caminho de destino no NAS.
+        Monta o caminho de destino no NAS a partir dos dados atuais da linha.
         Estrutura: {base}/{col1}/{col2}/.../{ID}/
         """
         parts = [
@@ -37,10 +38,113 @@ class NasService:
         invalid = r'\/:*?"<>|'
         for ch in invalid:
             value = value.replace(ch, "_")
-        return value.strip().strip(".")[:100]  # limite de 100 chars
+        return value.strip().strip(".")[:100]
 
     # ------------------------------------------------------------------
-    # Operações de arquivo
+    # Busca por ID
+    # ------------------------------------------------------------------
+
+    def find_product_folder(self, product_id: int) -> Optional[Path]:
+        """
+        Busca recursivamente no NAS a pasta cujo nome seja o ID do produto.
+        Retorna o Path encontrado ou None se não existir.
+
+        Isso permite localizar o produto independente de qual estrutura
+        de pastas organizadoras ele está atualmente (antes de mover).
+        """
+        try:
+            target_name = str(product_id)
+            for candidate in self.base_path.rglob(target_name):
+                if candidate.is_dir():
+                    self.logger.info(
+                        f"[NAS] Pasta do produto {product_id} encontrada: {candidate}"
+                    )
+                    return candidate
+            self.logger.info(
+                f"[NAS] Pasta do produto {product_id} não encontrada no NAS."
+            )
+            return None
+        except Exception as exc:
+            self.logger.error(
+                f"[NAS] Erro ao buscar pasta do produto {product_id}: {exc}",
+                exc_info=True,
+            )
+            return None
+
+    # ------------------------------------------------------------------
+    # Mover produto (manutenção de caminho)
+    # ------------------------------------------------------------------
+
+    def move_product_folder(self, current_path: Path, new_path: Path) -> bool:
+        """
+        Move toda a pasta de um produto de current_path para new_path.
+        Útil quando colunas organizadoras (ex: Marca, Linha_Colecao) mudam.
+        Retorna True em sucesso.
+        """
+        try:
+            if current_path == new_path:
+                self.logger.info(
+                    f"[NAS] Pasta já está no caminho correto, nenhuma movimentação necessária: "
+                    f"{current_path}"
+                )
+                return True
+
+            if not current_path.exists():
+                self.logger.warning(
+                    f"[NAS] Caminho de origem não encontrado para mover: {current_path}"
+                )
+                return False
+
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Se o destino já existe, mescla o conteúdo em vez de sobrescrever
+            if new_path.exists():
+                self.logger.warning(
+                    f"[NAS] Pasta de destino já existe. Mesclando conteúdo: {new_path}"
+                )
+                for item in current_path.iterdir():
+                    dest_item = new_path / item.name
+                    if dest_item.exists():
+                        dest_item.unlink()
+                    shutil.move(str(item), str(dest_item))
+                current_path.rmdir()
+            else:
+                shutil.move(str(current_path), str(new_path))
+
+            self.logger.info(f"[NAS] Pasta movida: {current_path} → {new_path}")
+
+            # Remove pastas pai que ficaram vazias após a movimentação
+            self._cleanup_empty_parents(current_path.parent)
+            return True
+
+        except Exception as exc:
+            self.logger.error(
+                f"[NAS] Erro ao mover pasta '{current_path}' → '{new_path}': {exc}",
+                exc_info=True,
+            )
+            return False
+
+    def _cleanup_empty_parents(self, folder: Path) -> None:
+        """
+        Remove recursivamente pastas pai que ficaram vazias
+        após uma movimentação, sem ultrapassar o base_path.
+        """
+        try:
+            current = folder
+            while current != self.base_path and current.exists():
+                if not any(current.iterdir()):
+                    current.rmdir()
+                    self.logger.debug(f"[NAS] Pasta vazia removida: {current}")
+                    current = current.parent
+                else:
+                    break
+        except Exception as exc:
+            self.logger.warning(
+                f"[NAS] Aviso ao limpar pastas vazias em '{folder}': {exc}"
+            )
+
+    # ------------------------------------------------------------------
+    # Salvar imagem
     # ------------------------------------------------------------------
 
     def save_image(self, source_path: Path, dest_folder: Path, filename: str) -> Optional[Path]:
@@ -61,10 +165,14 @@ class NasService:
             )
             return None
 
+    # ------------------------------------------------------------------
+    # Get / Delete (prontos para futura expansão)
+    # ------------------------------------------------------------------
+
     def get_image(self, nas_path: str) -> Optional[Path]:
         """
         Retorna o Path de uma imagem no NAS se existir.
-        Preparado para futura expansão (ex: download via protocolo).
+        Preparado para futura expansão (ex: acesso via protocolo SMB/NFS).
         """
         try:
             path = Path(nas_path)
