@@ -11,6 +11,12 @@ app = rx.App(
     stylesheets=[
         "https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Lato:wght@300;400;700;900&display=swap"
     ],
+    style={
+        "::selection": {
+            "background": "#a67c52",  # Sua cor accent
+            "color": "#ffffff",        # Texto branco quando selecionado
+        }
+    }
 )
 
 app.add_page(

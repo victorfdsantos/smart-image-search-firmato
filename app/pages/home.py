@@ -44,7 +44,6 @@ def search_panel():
             "Faça upload de uma imagem ou busque por texto",
             style=styles.get_base_text_style("14px", color=styles.COLORS["text_secondary"]),
         ),
-        # UPLOAD CORRIGIDO - mais compacto e ocupando toda largura
         rx.upload(
             rx.vstack(
                 rx.button(
@@ -77,16 +76,15 @@ def search_panel():
                 "background_color": f"{styles.COLORS['accent_light']}10",
             },
         ),
-        # INPUT CORRIGIDO - com borda visível e texto escuro
         rx.input(
             placeholder="Digite sua busca...",
             value=State.search_text,
             on_change=State.set_search_text,
-            border=f"1px solid {styles.COLORS['border_dark']}",  # Borda mais escura e visível
+            border=f"1px solid {styles.COLORS['border_dark']}", 
             border_radius="2px",
             background_color=styles.COLORS["surface"],
-            color=styles.COLORS["text_primary"],  # Texto digitado em preto
-            placeholder_color=styles.COLORS["text_secondary"],  # Placeholder em cinza médio
+            color=styles.COLORS["text_primary"], 
+            placeholder_color=styles.COLORS["text_primary"],
             padding="6px 16px",
             font_family="Inter, sans-serif",
             font_size="14px",
