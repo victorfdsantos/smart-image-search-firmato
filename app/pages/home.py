@@ -127,6 +127,16 @@ def search_panel():
             style=styles.outline_button_style,
             width="100%",
         ),
+        rx.button(
+            rx.hstack(
+                rx.icon(tag="x", size=20),
+                rx.text("Limpar filtros"),
+                spacing="2",
+            ),
+            on_click=State.clear_all,
+            style=styles.outline_button_style,
+            width="100%",
+        ),
         spacing="4",
         width="100%",
     )

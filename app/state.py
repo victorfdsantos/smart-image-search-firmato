@@ -132,3 +132,10 @@ class State(rx.State):
 
     def select_image(self, url: str):
         self.selected_image = url
+
+    async def clear_all(self):
+        self._image_bytes = b""
+        self.uploaded_image = ""
+        self.search_text = ""
+        self.page = 1
+        await self.load_products()
