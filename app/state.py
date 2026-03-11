@@ -139,3 +139,33 @@ class State(rx.State):
         self.search_text = ""
         self.page = 1
         await self.load_products()
+
+    def copy_image(self):
+        return rx.call_script(f"""
+            fetch('{self.selected_image}', {{mode: 'cors'}})
+                .then(r => r.blob())
+                .then(blob => {{
+                    const item = new ClipboardItem({{'image/jpeg': blob}});
+                    navigator.clipboard.write([item])
+                        .then(() => console.log('Copiado!'))
+                        .catch(e => console.error('Erro ao copiar:', e));
+                }})
+                .catch(e => console.error('Fetch falhou:', e));
+        """)
+
+    def download_image(self):
+        return rx.call_script(f"""
+            fetch('{self.selected_image}', {{mode: 'cors'}})
+                .then(r => r.blob())
+                .then(blob => {{
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = '{self.selected_image}'.split('/').pop();
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                }})
+                .catch(e => console.error('Download falhou:', e));
+        """)

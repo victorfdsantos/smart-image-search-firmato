@@ -149,6 +149,14 @@ def image_card(product: ProductSummary):
             height="240px",
             object_fit="cover",
             loading="lazy",
+            style={
+                "animation": "fadeIn 0.35s ease forwards",
+                "opacity": "0",
+                "@keyframes fadeIn": {
+                    "from": {"opacity": "0", "transform": "translateY(6px)"},
+                    "to": {"opacity": "1", "transform": "translateY(0)"},
+                },
+            },
         ),
         style=styles.image_card_style,
         on_click=State.select_image(product.imagem_url),
@@ -162,6 +170,7 @@ def image_grid():
             columns="3",
             spacing="4",
             width="100%",
+            key=State.search_text + State.page.to_string(),
         ),
         rx.center(
             rx.vstack(
@@ -248,6 +257,7 @@ def preview_panel():
                             rx.text("Copiar imagem"),
                             spacing="2",
                         ),
+                        on_click=State.copy_image,
                         style=styles.outline_button_style,
                         flex="1",
                     ),
@@ -257,6 +267,7 @@ def preview_panel():
                             rx.text("Download"),
                             spacing="2",
                         ),
+                        on_click=State.download_image,
                         style=styles.solid_button_style,
                         flex="1",
                     ),

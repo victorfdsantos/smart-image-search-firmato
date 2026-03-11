@@ -159,3 +159,11 @@ logo_style = {
         "opacity": "0.8",
     }
 }
+
+image_fade_style = {
+    "@keyframes fadeIn": {
+        "from": {"opacity": "0", "transform": "translateY(6px)"},
+        "to": {"opacity": "1", "transform": "translateY(0)"},
+    },
+    "animation": "fadeIn 0.35s ease forwards",
+}

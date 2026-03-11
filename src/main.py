@@ -7,6 +7,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 
 from config.settings import settings
 
@@ -39,6 +40,13 @@ app.mount(
     "/static/images",
     StaticFiles(directory=str(settings.general.tmp_images_path)),
     name="images",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(catalog_router)
