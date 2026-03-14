@@ -15,15 +15,12 @@ from services.json_service import JsonService
 
 _PROCESSED_MARKER = "Processada"
 
-# Campos que existem só no JSON — ignorados na comparação de dados
 _JSON_ONLY_FIELDS = {
     "caminho_imagem", "caminho_bucket_principal",
     *[f"caminho_imagem_secundaria{i}" for i in SECONDARY_SLOTS],
     *[f"caminho_bucket_secundaria{i}" for i in SECONDARY_SLOTS],
 }
 
-# Colunas do Excel que, se mudarem, exigem mover a pasta no NAS
-# Ordem: Categoria_Principal / Faixa_Preco / Marca
 _NAS_ORGANIZER_FIELDS = {
     "Categoria_Principal": "categoria_principal",
     "Faixa_Preco":         "faixa_preco",
@@ -32,7 +29,6 @@ _NAS_ORGANIZER_FIELDS = {
 
 
 def _clean(value) -> Optional[str]:
-    """Célula do Excel → string limpa ou None."""
     if value is None:
         return None
     s = str(value).strip()
@@ -40,17 +36,14 @@ def _clean(value) -> Optional[str]:
 
 
 def _normalize(value) -> str:
-    """Para comparação: None e string vazia são equivalentes."""
     return "" if value is None else str(value).strip()
 
 
 def _is_filename(value: Optional[str]) -> bool:
-    """True se é um filename solto (sem separador) — imagem pendente de processamento."""
     return bool(value) and "/" not in value and "\\" not in value
 
 
 def _is_processed(value: Optional[str]) -> bool:
-    """True se o slot já foi processado: caminho NAS (tem '/') ou marcador legado."""
     if not value:
         return False
     if "/" in value or "\\" in value:
@@ -66,7 +59,7 @@ class DiffService:
 
     def build(self, product_id: int, row_dict: dict) -> ProductDiff:
         """Constrói o ProductDiff comparando linha do Excel com JSON em disco."""
-        diff = ProductDiff(product_id=product_id, row_dict=row_dict)
+        diff = ProductDiff(product_id=product_id)
         existing = self.json_service.load(product_id)
 
         if existing is None:
@@ -74,11 +67,11 @@ class DiffService:
             diff.is_new_product = True
             diff.primary_excel_value = _clean(row_dict.get("Caminho_Imagem"))
             diff.primary_is_new = _is_filename(diff.primary_excel_value)
-            diff.secondaries = self._build_secondaries(row_dict, existing_json=None)
+            diff.secondaries = self._build_secondaries(product_id, row_dict, existing_json=None)
             return diff
 
         self._diff_primary(diff, row_dict, existing)
-        diff.secondaries = self._build_secondaries(row_dict, existing)
+        diff.secondaries = self._build_secondaries(product_id, row_dict, existing)
         self._diff_nas_path(diff, row_dict, existing)
         self._diff_data_fields(diff, row_dict, existing)
 
@@ -97,7 +90,7 @@ class DiffService:
         diff.primary_json_bucket_uri = existing.get("caminho_bucket_principal")
 
         if not _is_filename(excel_val):
-            return  # já processado ou vazio — sem mudança
+            return
 
         if diff.primary_json_nas_path:
             diff.primary_is_changed = True
@@ -107,18 +100,14 @@ class DiffService:
             self.logger.info(f"[Diff] Id {diff.product_id}: imagem principal NOVA. Arquivo='{excel_val}'")
 
     def _build_secondaries(
-        self, row_dict: dict, existing_json: Optional[dict]
+        self, product_id: int, row_dict: dict, existing_json: Optional[dict]
     ) -> list[SecondaryImageDiff]:
-        """
-        Constrói a lista de SecondaryImageDiff para todos os slots.
-        Funciona tanto para produto novo (existing_json=None) quanto existente.
-        """
         existing = existing_json or {}
         secondaries = []
 
         for slot in SECONDARY_SLOTS:
-            excel_val  = _clean(row_dict.get(SECONDARY_EXCEL_COLS[slot]))
-            json_nas   = existing.get(SECONDARY_NAS_FIELDS[slot])
+            excel_val   = _clean(row_dict.get(SECONDARY_EXCEL_COLS[slot]))
+            json_nas    = existing.get(SECONDARY_NAS_FIELDS[slot])
             json_bucket = existing.get(SECONDARY_BUCKET_FIELDS[slot])
 
             sec = SecondaryImageDiff(slot=slot, excel_value=excel_val,
@@ -126,20 +115,20 @@ class DiffService:
 
             if not excel_val and json_nas:
                 sec.is_deleted = True
-                self.logger.info(f"[Diff] Id ? Slot {slot}: DELETADO. NAS='{json_nas}'")
+                self.logger.info(f"[Diff] Id {product_id} Slot {slot}: DELETADO. NAS='{json_nas}'")
             elif not excel_val:
                 sec.is_empty = True
             elif _is_processed(excel_val) and json_nas:
                 sec.is_processed = True
             elif _is_filename(excel_val) and not json_nas:
                 sec.is_new = True
-                self.logger.info(f"[Diff] Id ? Slot {slot}: NOVA. Arquivo='{excel_val}'")
+                self.logger.info(f"[Diff] Id {product_id} Slot {slot}: NOVA. Arquivo='{excel_val}'")
             elif _is_filename(excel_val) and json_nas:
                 sec.is_changed = True
-                self.logger.info(f"[Diff] Id ? Slot {slot}: TROCADA. Novo='{excel_val}'")
+                self.logger.info(f"[Diff] Id {product_id} Slot {slot}: TROCADA. Novo='{excel_val}'")
             else:
                 sec.is_empty = True
-                self.logger.warning(f"[Diff] Id ? Slot {slot}: valor não reconhecido '{excel_val}'. Ignorando.")
+                self.logger.warning(f"[Diff] Id {product_id} Slot {slot}: valor não reconhecido '{excel_val}'. Ignorando.")
 
             secondaries.append(sec)
 

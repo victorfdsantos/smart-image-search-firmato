@@ -13,6 +13,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - HF_HOME=/app/.cache/huggingface
+      - CORS_ORIGINS=http://localhost:3000,http://firmato.local,http://192.168.18.14
 
     volumes:
       - ./src/config.ini:/app/src/config.ini:ro

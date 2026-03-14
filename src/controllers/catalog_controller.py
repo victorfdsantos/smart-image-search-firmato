@@ -1,9 +1,8 @@
-# src/controllers/catalog_controller.py
 import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from services.catalog_service import CatalogService
 from utils.logger import setup_logger
@@ -21,10 +20,9 @@ ENDPOINT_NAME = "catalog_register"
     summary="Cadastrar produtos a partir de planilha",
     description=(
         "Recebe um arquivo .xlsx com o catálogo de produtos, executa o fluxo de "
-        "processamento de imagens (redimensionamento, conversão, hash, NAS e GCS) e "
-        "atualiza os dados da planilha. Retorna estatísticas da execução."
+        "processamento de imagens e atualiza os dados da planilha. "
+        "Retorna estatísticas da execução."
     ),
-    response_description="Estatísticas do processamento",
 )
 async def register_catalog(file: UploadFile = File(...)) -> JSONResponse:
     if not file.filename.endswith((".xlsx", ".xlsm")):
@@ -60,3 +58,30 @@ async def register_catalog(file: UploadFile = File(...)) -> JSONResponse:
     finally:
         if temp_path.exists():
             temp_path.unlink()
+
+
+@router.get(
+    "/latest-log",
+    summary="Download do log mais recente do catalog_register",
+    description="Retorna o arquivo de log mais recente gerado pelo endpoint de cadastro.",
+)
+async def latest_log() -> FileResponse:
+    from config.settings import settings
+
+    logs_dir = settings.general.logs_path
+    logs = sorted(
+        logs_dir.glob("catalog_register_*.log"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+    if not logs:
+        raise HTTPException(status_code=404, detail="Nenhum log encontrado.")
+
+    latest = logs[0]
+    return FileResponse(
+        path=latest,
+        media_type="text/plain",
+        filename=latest.name,
+        headers={"Content-Disposition": f"attachment; filename={latest.name}"},
+    )

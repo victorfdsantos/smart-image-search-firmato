@@ -26,6 +26,9 @@ from services.json_service import JsonService
 from services.nas_service import NasService
 from services.spreadsheet_service import SpreadsheetService
 
+# Sentinela para distinguir "slot não tocado" de "slot deletado (None)"
+_ABSENT = object()
+
 
 class CatalogService:
 
@@ -39,9 +42,6 @@ class CatalogService:
 
         # Paths reais (com extensão) dos arquivos da landing a remover ao final
         self._landing_paths_to_clean: list[Path] = []
-        # Cache de caminhos NAS gerados nesta execução: (product_id, slot) → str | None
-        # None = slot foi deletado; ausente = não tocado (preserva JSON)
-        self._secondary_cache: dict[tuple[int, int], Optional[str]] = {}
 
     # ------------------------------------------------------------------
     # Ponto de entrada
@@ -89,7 +89,7 @@ class CatalogService:
                 continue
 
             try:
-                excel_updates = self._execute(diff)
+                excel_updates = self._execute(diff, row_dict)
             except Exception as exc:
                 self.logger.error(f"Id {product_id}: erro inesperado: {exc}", exc_info=True)
                 stats["erros"] += 1
@@ -132,39 +132,47 @@ class CatalogService:
     # Execução do diff
     # ------------------------------------------------------------------
 
-    def _execute(self, diff: ProductDiff) -> Optional[dict]:
-        """Executa todas as ações indicadas pelo diff. Retorna updates para o Excel ou None em erro bloqueante."""
+    def _execute(self, diff: ProductDiff, row_dict: dict) -> Optional[dict]:
+        """
+        Executa todas as ações indicadas pelo diff.
+        secondary_cache é local a esta chamada — slot → str (novo path) | None (deletado) | _ABSENT (não tocado).
+        Retorna updates para o Excel ou None em erro bloqueante.
+        """
+        secondary_cache: dict[int, object] = {}
+
         if diff.is_new_product:
-            return self._handle_new_product(diff)
+            return self._handle_new_product(diff, row_dict, secondary_cache)
 
         updates: dict = {}
 
         if diff.primary_is_new or diff.primary_is_changed:
-            result = self._handle_primary_image(diff)
+            result = self._handle_primary_image(diff, row_dict)
             if result is None:
                 return None
             updates.update(result)
 
         for sec in diff.secondary_changes:
-            updates.update(self._handle_secondary_image(diff, sec))
+            updates.update(self._handle_secondary_image(diff, row_dict, sec, secondary_cache))
 
         for sec in diff.secondary_deletions:
-            self._handle_secondary_deletion(diff, sec)
+            self._handle_secondary_deletion(diff, sec, secondary_cache)
 
         if diff.nas_path_changed:
-            result = self._handle_nas_path_change(diff)
+            result = self._handle_nas_path_change(diff, row_dict)
             if result is None:
                 return None
             updates.update(result)
 
-        self._save_json(diff)
+        self._save_json(diff, row_dict, secondary_cache)
         return updates
 
     # ------------------------------------------------------------------
     # Handlers
     # ------------------------------------------------------------------
 
-    def _handle_new_product(self, diff: ProductDiff) -> Optional[dict]:
+    def _handle_new_product(
+        self, diff: ProductDiff, row_dict: dict, secondary_cache: dict
+    ) -> Optional[dict]:
         pid = diff.product_id
         self.logger.info(f"Id {pid}: cadastro novo.")
 
@@ -174,74 +182,76 @@ class CatalogService:
 
         nas_path = self._process_image(pid, diff.primary_excel_value,
                                        self.image_service.primary_image_name(pid),
-                                       diff.row_dict, label="principal")
+                                       row_dict, label="principal")
         if nas_path is None:
             return None
 
         updates = {
-            "Chave_Especial": self.image_service.generate_hash(diff.row_dict),
+            "Chave_Especial": self.image_service.generate_hash(row_dict),
             "Caminho_Imagem": str(nas_path),
         }
 
         for sec in diff.secondaries:
             if sec.is_new:
-                updates.update(self._handle_secondary_image(diff, sec))
+                updates.update(self._handle_secondary_image(diff, row_dict, sec, secondary_cache))
 
-        self._save_json(diff, primary_nas=str(nas_path))
+        self._save_json(diff, row_dict, secondary_cache, primary_nas=str(nas_path))
         return updates
 
-    def _handle_primary_image(self, diff: ProductDiff) -> Optional[dict]:
+    def _handle_primary_image(self, diff: ProductDiff, row_dict: dict) -> Optional[dict]:
         pid = diff.product_id
         self.logger.info(f"Id {pid}: trocando imagem principal → '{diff.primary_excel_value}'")
 
         if diff.primary_json_nas_path:
             self.nas_service.delete_image(diff.primary_json_nas_path)
-        # GCS: self.storage_service.delete_image(Path(diff.primary_json_bucket_uri).name)
 
         nas_path = self._process_image(pid, diff.primary_excel_value,
                                        self.image_service.primary_image_name(pid),
-                                       diff.row_dict, label="principal")
+                                       row_dict, label="principal")
         if nas_path is None:
             return None
 
         return {"Caminho_Imagem": str(nas_path)}
 
-    def _handle_secondary_image(self, diff: ProductDiff, sec: SecondaryImageDiff) -> dict:
+    def _handle_secondary_image(
+        self, diff: ProductDiff, row_dict: dict,
+        sec: SecondaryImageDiff, secondary_cache: dict
+    ) -> dict:
         pid = diff.product_id
         slot = sec.slot
 
         if sec.is_changed and sec.json_nas_path:
             self.nas_service.delete_image(sec.json_nas_path)
-            # GCS: self.storage_service.delete_image(Path(sec.json_bucket_uri).name)
 
         nas_path = self._process_image(
             pid, sec.excel_value,
             self.image_service.secondary_image_name(pid, slot - 1),
-            diff.row_dict, label=f"secundária {slot}"
+            row_dict, label=f"secundária {slot}"
         )
 
         if nas_path is None:
             self.logger.warning(f"Id {pid}: falha na secundária slot {slot} — slot ignorado.")
             return {}
 
-        self._secondary_cache[(pid, slot)] = str(nas_path)
+        secondary_cache[slot] = str(nas_path)
         return {SECONDARY_EXCEL_COLS[slot]: str(nas_path)}
 
-    def _handle_secondary_deletion(self, diff: ProductDiff, sec: SecondaryImageDiff) -> None:
+    def _handle_secondary_deletion(
+        self, diff: ProductDiff, sec: SecondaryImageDiff, secondary_cache: dict
+    ) -> None:
         pid = diff.product_id
         self.logger.info(f"Id {pid}: deletando secundária slot {sec.slot}.")
 
         if sec.json_nas_path:
             self.nas_service.delete_image(sec.json_nas_path)
-        # GCS: if sec.json_bucket_uri: self.storage_service.delete_image(...)
 
-        self._secondary_cache[(pid, sec.slot)] = None  # sentinela: limpar no JSON
+        secondary_cache[sec.slot] = None  # sentinela: limpar no JSON
 
-    def _handle_nas_path_change(self, diff: ProductDiff) -> Optional[dict]:
+    def _handle_nas_path_change(self, diff: ProductDiff, row_dict: dict) -> Optional[dict]:
         pid = diff.product_id
         self.logger.info(f"Id {pid}: movendo pasta NAS.")
 
-        new_path = self.nas_service.build_product_path(diff.row_dict, pid)
+        new_path = self.nas_service.build_product_path(row_dict, pid)
         current_path = self.nas_service.find_product_folder(pid)
 
         if current_path is not None:
@@ -256,29 +266,27 @@ class CatalogService:
     # JSON
     # ------------------------------------------------------------------
 
-    def _save_json(self, diff: ProductDiff, primary_nas: Optional[str] = None) -> None:
-        """Constrói e salva o JSON do produto com o estado final."""
+    def _save_json(
+        self, diff: ProductDiff, row_dict: dict,
+        secondary_cache: dict, primary_nas: Optional[str] = None
+    ) -> None:
         pid = diff.product_id
         existing = self.json_service.load(pid) or {}
 
-        model = self.spreadsheet_service.row_to_model(diff.row_dict)
+        model = self.spreadsheet_service.row_to_model(row_dict)
 
-        # Imagem principal: novo caminho > existente no JSON
         model.caminho_imagem = primary_nas or existing.get("caminho_imagem")
         model.caminho_bucket_principal = existing.get("caminho_bucket_principal")
 
-        # Secundárias: cache desta execução > existente no JSON
-        # Cache ausente = não tocado (preserva); None = deletado (limpa); str = novo
-        _ABSENT = object()
         for slot in SECONDARY_SLOTS:
-            cached = self._secondary_cache.get((pid, slot), _ABSENT)
+            cached = secondary_cache.get(slot, _ABSENT)
             if cached is _ABSENT:
-                nas = existing.get(SECONDARY_NAS_FIELDS[slot])
+                nas    = existing.get(SECONDARY_NAS_FIELDS[slot])
                 bucket = existing.get(SECONDARY_BUCKET_FIELDS[slot])
             elif cached is None:
                 nas, bucket = None, None
             else:
-                nas = cached
+                nas    = cached
                 bucket = existing.get(SECONDARY_BUCKET_FIELDS[slot])
 
             setattr(model, SECONDARY_NAS_FIELDS[slot], nas)
@@ -295,13 +303,8 @@ class CatalogService:
         self, product_id: int, source_filename: str,
         dest_filename: str, row_dict: dict, label: str
     ) -> Optional[Path]:
-        """
-        Pipeline: valida → landing → resize/convert → NAS.
-        Retorna o Path NAS em sucesso ou None em falha (já logada).
-        """
         self.logger.info(f"Id {product_id}: [{label}] '{source_filename}' → '{dest_filename}'")
 
-        # file_exists_in_landing recebe o nome sem extensão e devolve o Path real
         source_filename_no_ext = Path(source_filename).stem
         landing_path = self.image_service.file_exists_in_landing(source_filename_no_ext)
         if landing_path is None:
@@ -321,9 +324,6 @@ class CatalogService:
                 self.logger.error(f"Id {product_id}: [{label}] falha ao salvar no NAS.")
                 return None
 
-            # GCS: self.storage_service.upload_image(temp_img, dest_filename)
-
-            # Registra o path real (com extensão correta) para remoção posterior
             self._landing_paths_to_clean.append(landing_path)
             self.logger.info(f"Id {product_id}: [{label}] salvo em {nas_path}")
             return nas_path
@@ -336,7 +336,6 @@ class CatalogService:
     # ------------------------------------------------------------------
 
     def _cleanup_landing(self) -> int:
-        # Deduplica por path real para não tentar remover duas vezes o mesmo arquivo
         seen: set[Path] = set()
         count = 0
         for path in self._landing_paths_to_clean:
