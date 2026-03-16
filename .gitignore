@@ -17,6 +17,7 @@ temp_uploads
 frontend
 backend
 .backend
+nas
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
