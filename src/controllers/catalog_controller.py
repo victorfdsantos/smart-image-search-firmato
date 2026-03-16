@@ -1,10 +1,11 @@
 import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from services.catalog_service import CatalogService
+from services.startup_service import StartupService
 from utils.logger import setup_logger
 
 _TEMP_UPLOAD_DIR = Path("./tmp_uploads")
@@ -18,11 +19,6 @@ ENDPOINT_NAME = "catalog_register"
 @router.post(
     "/register",
     summary="Cadastrar produtos a partir de planilha",
-    description=(
-        "Recebe um arquivo .xlsx com o catálogo de produtos, executa o fluxo de "
-        "processamento de imagens e atualiza os dados da planilha. "
-        "Retorna estatísticas da execução."
-    ),
 )
 async def register_catalog(file: UploadFile = File(...)) -> JSONResponse:
     if not file.filename.endswith((".xlsx", ".xlsm")):
@@ -60,10 +56,26 @@ async def register_catalog(file: UploadFile = File(...)) -> JSONResponse:
             temp_path.unlink()
 
 
+@router.post(
+    "/retrain",
+    summary="Reexecuta o StartupService (rebuild thumbnails + reload embeddings + CLIP)",
+)
+async def retrain(request: Request) -> JSONResponse:
+    logger = setup_logger("retrain")
+    logger.info("Retreinamento solicitado — reexecutando StartupService.")
+    try:
+        startup = StartupService(logger)
+        startup.run(request.app.state.__dict__)
+        logger.info("StartupService concluído com sucesso.")
+        return JSONResponse(content={"status": "success"}, status_code=200)
+    except Exception as exc:
+        logger.error(f"Erro no retreinamento: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @router.get(
     "/latest-log",
     summary="Download do log mais recente do catalog_register",
-    description="Retorna o arquivo de log mais recente gerado pelo endpoint de cadastro.",
 )
 async def latest_log() -> FileResponse:
     from config.settings import settings
