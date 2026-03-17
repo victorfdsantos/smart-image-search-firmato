@@ -2,10 +2,8 @@
 
 from contextlib import asynccontextmanager
 import logging
-from pathlib import Path
 
 import uvicorn
-import os
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -15,6 +13,7 @@ from config.settings import settings
 from controllers.catalog_controller import router as catalog_router
 from controllers.product_controller import router as product_router
 from controllers.search_controller import router as search_router
+from controllers.filter_controller import router as filter_router
 from services.startup_service import StartupService
 
 
@@ -22,14 +21,8 @@ from services.startup_service import StartupService
 async def lifespan(app: FastAPI):
     logger = logging.getLogger("startup")
     logging.basicConfig(level=logging.INFO)
-
-    # Garante que tmp_images existe antes de montar o StaticFiles
-    tmp_path = settings.general.tmp_images_path
-    tmp_path.mkdir(parents=True, exist_ok=True)
-
     startup = StartupService(logger)
     startup.run(app.state.__dict__)
-
     yield
 
 
@@ -46,6 +39,7 @@ app.mount(
     name="images",
 )
 
+import os
 origins = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 app.add_middleware(
@@ -58,9 +52,10 @@ app.add_middleware(
 app.include_router(catalog_router)
 app.include_router(product_router)
 app.include_router(search_router)
+app.include_router(filter_router)
 
 
-@app.get("/health", tags=["System"], summary="Health check")
+@app.get("/health", tags=["System"])
 async def health_check() -> JSONResponse:
     return JSONResponse(content={"status": "ok", "service": "catalog-processor"})
 

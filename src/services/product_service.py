@@ -14,16 +14,26 @@ class ProductService:
         self.logger = logger
         self.data_dir = settings.general.data_path
 
-    def list_active(self, page: int = 1, page_size: int = 20) -> dict:
+    def list_active(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        allowed_ids: Optional[set] = None,
+    ) -> dict:
         all_products = []
 
         for json_path in sorted(
             self.data_dir.glob("*.json"),
-            key=lambda p: int(p.stem) if p.stem.isdigit() else 0
+            key=lambda p: int(p.stem) if p.stem.isdigit() else 0,
         ):
             product = self._load(json_path)
-            if product and self._is_active(product):
-                all_products.append(self._to_summary(product))
+            if not product:
+                continue
+            if not self._is_active(product):
+                continue
+            if allowed_ids is not None and int(product.get("id_produto", -1)) not in allowed_ids:
+                continue
+            all_products.append(self._to_summary(product))
 
         total = len(all_products)
         start = (page - 1) * page_size
@@ -44,10 +54,6 @@ class ProductService:
             return None
         return self._load(path)
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     def _load(self, path: Path) -> Optional[dict]:
         try:
             with open(path, encoding="utf-8") as f:
@@ -62,13 +68,13 @@ class ProductService:
     def _to_summary(self, product: dict) -> dict:
         pid = product.get("id_produto")
         return {
-            "id_produto":           pid,
-            "nome_produto":         product.get("nome_produto"),
-            "marca":                product.get("marca"),
-            "categoria_principal":  product.get("categoria_principal"),
-            "faixa_preco":          product.get("faixa_preco"),
-            "altura_cm":            product.get("altura_cm"),
-            "largura_cm":           product.get("largura_cm"),
-            "profundidade_cm":      product.get("profundidade_cm"),
-            "imagem_url":           f"/static/images/{pid}.jpg",
+            "id_produto":          pid,
+            "nome_produto":        product.get("nome_produto"),
+            "marca":               product.get("marca"),
+            "categoria_principal": product.get("categoria_principal"),
+            "faixa_preco":         product.get("faixa_preco"),
+            "altura_cm":           product.get("altura_cm"),
+            "largura_cm":          product.get("largura_cm"),
+            "profundidade_cm":     product.get("profundidade_cm"),
+            "imagem_url":          f"/static/images/{pid}.jpg",
         }

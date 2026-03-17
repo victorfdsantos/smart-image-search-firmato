@@ -3,6 +3,7 @@
 import json
 import logging
 from io import BytesIO
+from typing import Optional
 
 import numpy as np
 import torch
@@ -27,26 +28,32 @@ class SearchService:
     # Ponto de entrada
     # ------------------------------------------------------------------
 
-    def search(self, query: str = None, image_bytes: bytes = None, top_k: int = 20) -> list[dict]:
+    def search(
+        self,
+        query: str = None,
+        image_bytes: bytes = None,
+        top_k: int = 20,
+        allowed_ids: Optional[set] = None,
+    ) -> list[dict]:
         """
         query=texto, image_bytes=None → só texto
         query=None, image_bytes=bytes → só imagem
         query=texto, image_bytes=bytes → combinado 50/50
+        allowed_ids: conjunto de IDs permitidos pelos filtros (None = sem restrição)
         """
         if self.embeddings is None or self.clip_model is None:
             self.logger.warning("[Search] Embeddings ou CLIP não disponíveis.")
             return []
 
-        text_emb = self._encode_text(query) if query and query.strip() else None
+        text_emb  = self._encode_text(query) if query and query.strip() else None
         image_emb = self._encode_image(image_bytes) if image_bytes else None
 
         if text_emb is None and image_emb is None:
             return []
 
-        # Combinação 50/50 se ambos presentes
         if text_emb is not None and image_emb is not None:
-            combined = (text_emb + image_emb) / 2
-            query_emb = combined / np.linalg.norm(combined)  # renormaliza
+            combined  = (text_emb + image_emb) / 2
+            query_emb = combined / np.linalg.norm(combined)
             self.logger.info("[Search] Modo: texto + imagem (50/50)")
         elif text_emb is not None:
             query_emb = text_emb
@@ -55,7 +62,7 @@ class SearchService:
             query_emb = image_emb
             self.logger.info("[Search] Modo: só imagem")
 
-        return self._similarity_search(query_emb, top_k)
+        return self._similarity_search(query_emb, top_k, allowed_ids)
 
     # ------------------------------------------------------------------
     # Encode
@@ -75,7 +82,7 @@ class SearchService:
             ).to(self.clip_device)
             with torch.no_grad():
                 emb = self.clip_model.get_text_features(**inputs)
-                return F.normalize(emb, p=2, dim=-1).cpu().numpy()[0]  # (768,)
+                return F.normalize(emb, p=2, dim=-1).cpu().numpy()[0]
         except Exception as exc:
             self.logger.warning(f"[Search] Falha ao encodar texto: {exc}")
             return None
@@ -86,7 +93,7 @@ class SearchService:
             inputs = self.clip_processor(images=img, return_tensors="pt").to(self.clip_device)
             with torch.no_grad():
                 emb = self.clip_model.get_image_features(**inputs)
-                return F.normalize(emb, p=2, dim=-1).cpu().numpy()[0]  # (768,)
+                return F.normalize(emb, p=2, dim=-1).cpu().numpy()[0]
         except Exception as exc:
             self.logger.warning(f"[Search] Falha ao encodar imagem: {exc}")
             return None
@@ -95,24 +102,31 @@ class SearchService:
     # Similaridade
     # ------------------------------------------------------------------
 
-    def _similarity_search(self, query_emb: np.ndarray, top_k: int) -> list[dict]:
-        scores = self.embeddings @ query_emb  # (N,)
+    def _similarity_search(
+        self, query_emb: np.ndarray, top_k: int, allowed_ids: Optional[set] = None
+    ) -> list[dict]:
+        scores      = self.embeddings @ query_emb
         top_indices = np.argsort(scores)[::-1]
 
         results = []
         for idx in top_indices:
             if len(results) >= top_k:
                 break
-            meta = self.metadata[idx]
+            meta       = self.metadata[idx]
             product_id = meta.get("id")
+
+            if allowed_ids is not None and int(product_id) not in allowed_ids:
+                continue
+
             product_data = self._load_json(product_id)
             if product_data is None:
                 continue
             if str(product_data.get("status", "")).strip().lower() != "ativo":
                 continue
+
             results.append({
                 "id_produto": product_id,
-                "score": float(scores[idx]),
+                "score":      float(scores[idx]),
                 "imagem_url": f"/static/images/{product_id}.jpg",
             })
 
