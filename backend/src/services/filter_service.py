@@ -29,99 +29,89 @@ FILTER_LABELS = {
     "material_principal":  "Material Principal",
 }
 
-
-def _split_values(raw: str) -> list[str]:
-    """
-    Divide valores com '/' ou ' / ' em opções individuais.
-    Ex: "Sala de Jantar / Cozinha / Varanda" → ["Sala de Jantar", "Cozinha", "Varanda"]
-    """
-    parts = re.split(r"\s*/\s*", raw.strip())
-    return [p.strip() for p in parts if p.strip()]
-
+_INDEX_FILE = settings.nas.utils / "filters.json"
 
 class FilterService:
-
     def __init__(self, logger: logging.Logger):
         self.logger = logger
-        self.data_dir = settings.general.data_path
 
     def get_options(self, active_filters: dict[str, list[str]]) -> dict[str, list[str]]:
-        """
-        Retorna as opções disponíveis para cada campo de filtro,
-        considerando apenas os produtos que passam nos filtros já ativos.
+        self.logger.info(f"[Filter] active_filters={active_filters}")
 
-        active_filters: {field: [valor1, valor2, ...]}
-        Retorna: {field: [opcao1, opcao2, ...]} — ordenado alfabeticamente
-        """
-        products = self._load_active_products()
+        index = self._load()
 
-        # Aplica os filtros ativos para restringir o conjunto base
-        filtered = self._apply_filters(products, active_filters)
+        all_ids = set()
+        for field in index:
+            for ids in index[field].values():
+                all_ids.update(ids)
 
-        # Para cada campo, coleta os valores únicos nos produtos filtrados
-        options: dict[str, list[str]] = {}
-        for field in FILTER_FIELDS:
-            values: set[str] = set()
-            for product in filtered:
-                raw = product.get(field)
-                if raw and str(raw).strip().lower() not in ("nan", "none", ""):
-                    for v in _split_values(str(raw)):
-                        values.add(v)
-            options[field] = sorted(values)
+        self.logger.debug(f"[Filter] total_ids={len(all_ids)}")
+
+        current_ids = all_ids
+
+        for field, selected_values in active_filters.items():
+            if not selected_values:
+                continue
+
+            field_ids = set()
+            for val in selected_values:
+                field_ids.update(index.get(field, {}).get(val, []))
+
+            self.logger.debug(
+                f"[Filter] field={field} selected={selected_values} matched_ids={len(field_ids)}"
+            )
+
+            current_ids = current_ids.intersection(field_ids)
+
+            self.logger.debug(
+                f"[Filter] após '{field}' → current_ids={len(current_ids)}"
+            )
+
+        if not current_ids:
+            self.logger.warning("[Filter] Nenhum produto após aplicar filtros")
+
+        options = {}
+
+        for field in index:
+            valid_values = []
+
+            for val, ids in index[field].items():
+                if current_ids.intersection(ids):
+                    valid_values.append(val)
+
+            options[field] = sorted(valid_values)
+
+        self.logger.debug(
+            "[Filter] options_counts=" +
+            ", ".join(f"{f}={len(v)}" for f, v in options.items())
+        )
 
         return options
+    
+    def get_filtered_ids(self, active_filters: dict[str, list[str]]) -> set[int]:
+        index = self._load()
 
-    def _apply_filters(
-        self, products: list[dict], filters: dict[str, list[str]]
-    ) -> list[dict]:
-        """
-        Retorna apenas os produtos que satisfazem TODOS os filtros ativos.
-        Para campos com '/', um produto passa se qualquer um dos seus sub-valores
-        estiver na lista de filtros selecionados.
-        """
-        if not filters:
-            return products
+        all_ids = set()
+        for field in index:
+            for ids in index[field].values():
+                all_ids.update(ids)
 
-        result = []
-        for product in products:
-            match = True
-            for field, selected_values in filters.items():
-                if not selected_values:
-                    continue
-                raw = product.get(field)
-                if not raw or str(raw).strip().lower() in ("nan", "none", ""):
-                    match = False
-                    break
-                product_values = _split_values(str(raw))
-                # Produto passa se tiver ao menos um valor em comum com os selecionados
-                if not any(v in selected_values for v in product_values):
-                    match = False
-                    break
-            if match:
-                result.append(product)
+        current_ids = all_ids
 
-        return result
+        for field, selected_values in active_filters.items():
+            if not selected_values:
+                continue
 
-    def filter_product_ids(self, filters: dict[str, list[str]]) -> set[int]:
-        """
-        Retorna o conjunto de IDs dos produtos que passam nos filtros.
-        Usado pelo SearchService para pós-filtrar resultados.
-        """
-        if not filters:
-            return None  # None = sem filtro, retorna tudo
+            field_ids = set()
+            for val in selected_values:
+                field_ids.update(index.get(field, {}).get(val, []))
 
-        products = self._load_active_products()
-        filtered = self._apply_filters(products, filters)
-        return {int(p["id_produto"]) for p in filtered if p.get("id_produto")}
+            current_ids = current_ids.intersection(field_ids)
 
-    def _load_active_products(self) -> list[dict]:
-        products = []
-        for json_path in self.data_dir.glob("*.json"):
-            try:
-                with open(json_path, encoding="utf-8") as f:
-                    data = json.load(f)
-                if str(data.get("status", "")).strip().lower() == "ativo":
-                    products.append(data)
-            except Exception as exc:
-                self.logger.warning(f"[Filter] Erro ao ler {json_path}: {exc}")
-        return products
+        return set(int(i) for i in current_ids)
+    
+    def _load(self) -> dict:
+        if not _INDEX_FILE.exists():
+            return {f: {} for f in FILTER_FIELDS}
+        with open(_INDEX_FILE, encoding="utf-8") as f:
+            return json.load(f)

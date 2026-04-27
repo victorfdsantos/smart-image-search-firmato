@@ -5,14 +5,9 @@ import logging
 import pickle
 import shutil
 from pathlib import Path
-
 import numpy as np
 from PIL import Image
-
 from config.settings import settings
-
-_THUMBNAIL_SIZE = (400, 400)
-
 
 class StartupService:
 
@@ -129,9 +124,10 @@ class StartupService:
     # ------------------------------------------------------------------
 
     def _rebuild_tmp_images(self) -> None:
-        tmp_dir  = settings.general.tmp_images_path
-        nas_base = settings.nas.base_path
+        tmp_dir = settings.general.tmp_images_path
+        thumbnail_dir = settings.nas.thumbnail
 
+        # limpa diretório temporário
         tmp_dir.mkdir(parents=True, exist_ok=True)
         for item in tmp_dir.iterdir():
             try:
@@ -144,26 +140,26 @@ class StartupService:
 
         self.logger.info(f"[Startup] tmp_images limpo: {tmp_dir}")
 
-        if not nas_base.exists():
-            self.logger.warning(f"[Startup] NAS não encontrado: {nas_base}")
+        # valida existência da pasta de thumbnails
+        if not thumbnail_dir.exists():
+            self.logger.warning(f"[Startup] Pasta de thumbnails não encontrada: {thumbnail_dir}")
             return
 
         copied = 0
         conflicts: dict[str, Path] = {}
 
-        for img_path in nas_base.rglob("*.jpg"):
+        for img_path in thumbnail_dir.rglob("*.jpg"):
             filename = img_path.name
+
             if filename in conflicts:
                 self.logger.warning(f"[Startup] Conflito ignorado: '{filename}'")
                 continue
+
             try:
-                with Image.open(img_path) as img:
-                    img = img.convert("RGB")
-                    img.thumbnail(_THUMBNAIL_SIZE, Image.LANCZOS)
-                    img.save(tmp_dir / filename, "JPEG", quality=82, optimize=True)
+                shutil.copy2(img_path, tmp_dir / filename)
                 conflicts[filename] = img_path
                 copied += 1
             except Exception as exc:
-                self.logger.warning(f"[Startup] Falha ao processar '{img_path}': {exc}")
+                self.logger.warning(f"[Startup] Falha ao copiar '{img_path}': {exc}")
 
-        self.logger.info(f"[Startup] {copied} thumbnail(s) gerada(s).")
+        self.logger.info(f"[Startup] {copied} thumbnail(s) copiadas.")

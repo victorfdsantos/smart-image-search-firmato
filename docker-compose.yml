@@ -14,12 +14,15 @@ services:
       - PYTHONUNBUFFERED=1
       - HF_HOME=/app/.cache/huggingface
       - CORS_ORIGINS=http://localhost,http://firmato.local
+      - SHAREPOINT_CLIENT_SECRET=${SHAREPOINT_CLIENT_SECRET}
     volumes:
       - ./backend/src/config.ini:/app/src/config.ini:ro
       - ./backend/src/config:/app/src/config
       - ./nas/landing:/app/src/nas/landing
       - ./nas/data:/app/src/nas/data
       - ./nas/output:/app/src/nas/output
+      - ./nas/thumbnail:/app/src/nas/thumbnail
+      - ./nas/utils:/app/src/nas/utils
       - ./nas/embeddings:/app/src/nas/embeddings
       - ./nas/logs:/app/src/nas/logs
       - clip_cache:/app/.cache/huggingface

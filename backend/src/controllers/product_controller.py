@@ -52,7 +52,7 @@ async def list_products(
     allowed_ids = None
     if active_filters:
         filter_service = FilterService(logger)
-        allowed_ids = filter_service.filter_product_ids(active_filters)
+        allowed_ids = filter_service.get_filtered_ids(active_filters)
         logger.info(f"[Filter] allowed_ids={allowed_ids}")
 
     result = ProductService(logger).list_active(

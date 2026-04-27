@@ -1,355 +1,250 @@
 """
-CatalogService
---------------
-Orquestra o fluxo de cadastro e manutenção do catálogo.
+CatalogService — orquestra o pipeline completo de processamento do catálogo.
 
-Por produto:
-  1. DiffService compara Excel vs JSON → ProductDiff
-  2. CatalogService executa as ações indicadas pelo diff
-  3. JSON é salvo com o estado final
-  4. Excel é atualizado com novos caminhos
+Fluxo de PRIMEIRO CARREGAMENTO (sem mirror CSV):
+  1. Lê planilha via SharePoint API
+  2. Para cada produto ativo com imagem na landing:
+     a. Processa imagem → output/ e thumbnail/
+     b. Cria data/{id}.json
+  3. Constrói filters.json (índice de filtros)
+  4. Atualiza planilha no SharePoint com caminhos das imagens
+  5. Salva mirror CSV (espelho do estado atual)
+  6. Dispara retreinamento de embeddings (via EmbeddingService)
+
+Fluxo de RECARREGAMENTO (mirror CSV existente):
+  1. Lê planilha via SharePoint API
+  2. Compara com mirror CSV → DeltaResult
+  3. Aplica mudanças (novas imagens, dados alterados, produtos removidos)
+  4. Atualiza filters.json incrementalmente
+  5. Atualiza planilha no SharePoint (apenas linhas alteradas)
+  6. Salva mirror CSV atualizado
+  7. Dispara retreinamento de embeddings apenas para IDs alterados
+
+Garantia de zero-downtime:
+  O retreinamento de embeddings usa arquivos de staging que só são trocados
+  pelos de produção após o treino completo (swap atômico via os.replace).
+  O app_state é atualizado em memória apenas após o swap.
+  Enquanto o retreinamento ocorre, a API continua servindo os embeddings
+  antigos sem interrupção.
 """
 
 import logging
-import shutil
-import tempfile
 from pathlib import Path
-from typing import Optional
 
 from config.settings import settings
-from models.product_model import ProductModel, SECONDARY_SLOTS, SECONDARY_EXCEL_COLS, SECONDARY_NAS_FIELDS, SECONDARY_BUCKET_FIELDS
-from models.product_diff_model import ProductDiff
-from models.secondary_image_diff_model import SecondaryImageDiff
-from services.diff_service import DiffService
+from services.filter_index_service import FilterIndexService
 from services.image_service import ImageService
-from services.json_service import JsonService
-from services.nas_service import NasService
-from services.spreadsheet_service import SpreadsheetService
+from services.mirror_service import DeltaResult, MirrorService
+from services.product_data_service import ProductDataService
+from services.sharepoint_service import SharePointService
 
-# Sentinela para distinguir "slot não tocado" de "slot deletado (None)"
-_ABSENT = object()
+_HASH_COLUMNS = [
+    "Id_produto", "Nome_Produto", "Marca", "Categoria_Principal", "Subcategoria"
+]
+
+
+def _clean(val) -> str:
+    if val is None:
+        return ""
+    s = str(val).strip()
+    return "" if s.lower() in ("nan", "none") else s
+
+
+def _is_filename(val: str) -> bool:
+    """True se o valor parece um nome de arquivo (sem barras)."""
+    return bool(val) and "/" not in val and "\\" not in val
 
 
 class CatalogService:
 
-    def __init__(self, logger: logging.Logger):
+    def __init__(self, logger: logging.Logger, app_state: dict):
         self.logger = logger
-        self.image_service = ImageService(logger)
-        self.nas_service = NasService(logger)
-        self.spreadsheet_service = SpreadsheetService(logger)
-        self.json_service = JsonService(logger)
-        self.diff_service = DiffService(logger, self.json_service)
-
-        # Paths reais (com extensão) dos arquivos da landing a remover ao final
-        self._landing_paths_to_clean: list[Path] = []
+        self.app_state = app_state
+        self.sp = SharePointService(logger)
+        self.mirror = MirrorService(logger)
+        self.image = ImageService(logger)
+        self.data = ProductDataService(logger)
+        self.filter_index = FilterIndexService(logger)
+        self.nas = settings.nas
 
     # ------------------------------------------------------------------
     # Ponto de entrada
     # ------------------------------------------------------------------
 
-    def process_spreadsheet(self, xlsx_path: Path) -> dict:
+    def process(self) -> dict:
         stats = {
-            "total": 0, "novos": 0, "imagem_principal_atualizada": 0,
-            "secundarias_processadas": 0, "secundarias_deletadas": 0,
-            "pasta_nas_movida": 0, "dados_atualizados": 0,
-            "ignorados": 0, "erros": 0, "arquivos_limpos": 0,
+            "total_rows": 0,
+            "new_products": 0,
+            "images_updated": 0,
+            "data_updated": 0,
+            "removed": 0,
+            "image_errors": 0,
+            "retrain_clip_ids": [],
+            "retrain_data_ids": [],
+            "errors": [],
         }
 
-        self.logger.info(f"{'=' * 60}\nIniciando processamento: {xlsx_path}\n{'=' * 60}")
+        # 1. Lê planilha
+        rows = self.sp.read_catalog()
+        stats["total_rows"] = len(rows)
 
-        try:
-            df = self.spreadsheet_service.load(xlsx_path)
-        except Exception as exc:
-            self.logger.error(f"Falha crítica ao abrir planilha: {exc}", exc_info=True)
-            raise
+        # 2. Calcula delta
+        delta = self.mirror.compute_delta(rows)
 
-        stats["total"] = len(df)
+        is_first_load = not bool(self.mirror.load_mirror())
 
-        for idx, row in df.iterrows():
-            row_dict = row.to_dict()
-            product_id = self.spreadsheet_service.parse_id(row_dict.get("Id_produto"))
+        if is_first_load:
+            self.logger.info("[Catalog] PRIMEIRO CARREGAMENTO detectado.")
+            self._process_first_load(rows, stats)
+        else:
+            self.logger.info("[Catalog] RECARREGAMENTO incremental.")
+            self._process_delta(delta, stats)
 
-            if product_id is None:
-                self.logger.warning(f"Linha {idx + 2}: Id_produto inválido — pulando.")
-                stats["erros"] += 1
-                continue
+        # 3. Garante que o mirror seja atualizado após processar
+        # (rows já contém os caminhos atualizados nas posições certas
+        #  porque atualizamos os dicts diretamente)
+        self.mirror.save_mirror(rows)
 
-            self.logger.info(f"{'─' * 50}\nLinha {idx + 2} | Id {product_id}")
+        # 4. Retorna IDs para retreinamento (executado pelo controller)
+        stats["retrain_clip_ids"] = delta.image_ids if not is_first_load else [
+            _clean(r.get("Id_produto")) for r in rows
+            if _clean(r.get("Id_produto")) and _clean(r.get("Status")).lower() == "ativo"
+        ]
+        stats["retrain_data_ids"] = delta.data_ids if not is_first_load else stats["retrain_clip_ids"]
 
-            try:
-                diff = self.diff_service.build(product_id, row_dict)
-            except Exception as exc:
-                self.logger.error(f"Id {product_id}: erro no diff: {exc}", exc_info=True)
-                stats["erros"] += 1
-                continue
-
-            if not diff.has_any_change:
-                self.logger.info(f"Id {product_id}: sem alterações.")
-                stats["ignorados"] += 1
-                continue
-
-            try:
-                excel_updates = self._execute(diff, row_dict)
-            except Exception as exc:
-                self.logger.error(f"Id {product_id}: erro inesperado: {exc}", exc_info=True)
-                stats["erros"] += 1
-                continue
-
-            if excel_updates is None:
-                stats["erros"] += 1
-                continue
-
-            for col, val in excel_updates.items():
-                if col in df.columns:
-                    df.at[idx, col] = val
-
-            self._count_stats(stats, diff)
-
-        self.spreadsheet_service.save(df, xlsx_path)
-        stats["arquivos_limpos"] = self._cleanup_landing()
-        self.logger.info(f"Concluído. Stats: {stats}")
         return stats
 
-    def _count_stats(self, stats: dict, diff: ProductDiff) -> None:
-        if diff.is_new_product:
-            stats["novos"] += 1
-            return
-        if diff.primary_is_changed:
-            stats["imagem_principal_atualizada"] += 1
-        if diff.secondary_changes:
-            stats["secundarias_processadas"] += len(diff.secondary_changes)
-        if diff.secondary_deletions:
-            stats["secundarias_deletadas"] += len(diff.secondary_deletions)
-        if diff.nas_path_changed:
-            stats["pasta_nas_movida"] += 1
-        if diff.data_fields_changed and not any([
-            diff.primary_is_changed, diff.secondary_changes,
-            diff.secondary_deletions, diff.nas_path_changed
-        ]):
-            stats["dados_atualizados"] += 1
-
     # ------------------------------------------------------------------
-    # Execução do diff
+    # Primeiro carregamento
     # ------------------------------------------------------------------
 
-    def _execute(self, diff: ProductDiff, row_dict: dict) -> Optional[dict]:
-        """
-        Executa todas as ações indicadas pelo diff.
-        secondary_cache é local a esta chamada — slot → str (novo path) | None (deletado) | _ABSENT (não tocado).
-        Retorna updates para o Excel ou None em erro bloqueante.
-        """
-        secondary_cache: dict[int, object] = {}
+    def _process_first_load(self, rows: list[dict], stats: dict) -> None:
+        sharepoint_updates: list[dict] = []
 
-        if diff.is_new_product:
-            return self._handle_new_product(diff, row_dict, secondary_cache)
+        for row in rows:
+            pid = _clean(row.get("Id_produto"))
+            if not pid:
+                continue
 
-        updates: dict = {}
+            status = _clean(row.get("Status")).lower()
 
-        if diff.primary_is_new or diff.primary_is_changed:
-            result = self._handle_primary_image(diff, row_dict)
-            if result is None:
-                return None
-            updates.update(result)
+            # Gera hash / chave especial
+            chave = ImageService.generate_hash(row, _HASH_COLUMNS)
+            row["Chave_Especial"] = chave
 
-        for sec in diff.secondary_changes:
-            updates.update(self._handle_secondary_image(diff, row_dict, sec, secondary_cache))
+            paths: dict = {}
 
-        for sec in diff.secondary_deletions:
-            self._handle_secondary_deletion(diff, sec, secondary_cache)
+            # Imagem principal
+            img_col = _clean(row.get("Caminho_Imagem"))
+            if img_col and _is_filename(img_col):
+                source = self.image.find_in_landing(img_col)
+                if source:
+                    fname = ImageService.primary_filename(pid)
+                    ok = self.image.process(source, fname)
+                    if ok:
+                        paths["caminho_output"]    = str(self.nas.output / fname)
+                        paths["caminho_thumbnail"] = str(self.nas.thumbnail / fname)
+                        row["Caminho_Imagem"] = paths["caminho_output"]
+                        stats["new_products"] += 1
+                    else:
+                        stats["image_errors"] += 1
+                else:
+                    self.logger.warning(f"[Catalog] Id {pid}: imagem principal não encontrada na landing.")
+                    stats["image_errors"] += 1
 
-        if diff.nas_path_changed:
-            result = self._handle_nas_path_change(diff, row_dict)
-            if result is None:
-                return None
-            updates.update(result)
+            # Cria JSON
+            data_dict = self.data.row_to_dict(row)
+            data_dict.update(paths)
+            self.data.save(pid, data_dict)
 
-        self._save_json(diff, row_dict, secondary_cache)
-        return updates
+            # Atualiza índice de filtros
+            self.filter_index.upsert_product(
+                int(float(pid)), row, is_active=(status == "ativo")
+            )
+
+            # Coleta atualização para o SharePoint
+            upd = {"Id_produto": pid, "Chave_Especial": chave}
+            if "Caminho_Imagem" in row:
+                upd["Caminho_Imagem"] = row["Caminho_Imagem"]
+            sharepoint_updates.append(upd)
+
+        # Rebuild completo do índice de filtros (garante consistência)
+        self.filter_index.build_from_rows(rows)
+
+        # Atualiza SharePoint
+        self.sp.update_image_paths(sharepoint_updates)
 
     # ------------------------------------------------------------------
-    # Handlers
+    # Recarregamento incremental
     # ------------------------------------------------------------------
 
-    def _handle_new_product(
-        self, diff: ProductDiff, row_dict: dict, secondary_cache: dict
-    ) -> Optional[dict]:
-        pid = diff.product_id
-        self.logger.info(f"Id {pid}: cadastro novo.")
+    def _process_delta(self, delta: DeltaResult, stats: dict) -> None:
+        sharepoint_updates: list[dict] = []
 
-        if not diff.primary_excel_value:
-            self.logger.error(f"Id {pid}: produto novo sem imagem principal — ignorado.")
-            return None
+        # — Produtos removidos —
+        for pid in delta.removed_ids:
+            self.data.mark_removed(pid)
+            self.filter_index.remove_product(int(float(pid)))
+            stats["removed"] += 1
 
-        nas_path = self._process_image(pid, diff.primary_excel_value,
-                                       self.image_service.primary_image_name(pid),
-                                       row_dict, label="principal")
-        if nas_path is None:
-            return None
-
-        updates = {
-            "Chave_Especial": self.image_service.generate_hash(row_dict),
-            "Caminho_Imagem": str(nas_path),
+        all_changed = {
+            **delta.new_products,
+            **delta.image_changed,
+            **delta.data_changed,
         }
 
-        for sec in diff.secondaries:
-            if sec.is_new:
-                updates.update(self._handle_secondary_image(diff, row_dict, sec, secondary_cache))
+        for pid, row in all_changed.items():
+            status = _clean(row.get("Status")).lower()
+            existing = self.data.load(pid)
+            is_new = existing is None
+            paths: dict = {}
 
-        self._save_json(diff, row_dict, secondary_cache, primary_nas=str(nas_path))
-        return updates
+            chave = ImageService.generate_hash(row, _HASH_COLUMNS)
+            row["Chave_Especial"] = chave
 
-    def _handle_primary_image(self, diff: ProductDiff, row_dict: dict) -> Optional[dict]:
-        pid = diff.product_id
-        self.logger.info(f"Id {pid}: trocando imagem principal → '{diff.primary_excel_value}'")
+            # Processa imagem principal se mudou
+            if pid in delta.new_products or pid in delta.image_changed:
+                img_col = _clean(row.get("Caminho_Imagem"))
+                if img_col and _is_filename(img_col):
+                    # Remove imagem antiga se existia
+                    if existing:
+                        old_fname = ImageService.primary_filename(pid)
+                        self.image.delete(old_fname)
+                    source = self.image.find_in_landing(img_col)
+                    if source:
+                        fname = ImageService.primary_filename(pid)
+                        ok = self.image.process(source, fname)
+                        if ok:
+                            paths["caminho_output"]    = str(self.nas.output / fname)
+                            paths["caminho_thumbnail"] = str(self.nas.thumbnail / fname)
+                            row["Caminho_Imagem"] = paths["caminho_output"]
+                            if is_new:
+                                stats["new_products"] += 1
+                            else:
+                                stats["images_updated"] += 1
+                        else:
+                            stats["image_errors"] += 1
+                    else:
+                        self.logger.warning(f"[Catalog] Id {pid}: imagem principal não encontrada.")
+                        stats["image_errors"] += 1
 
-        if diff.primary_json_nas_path:
-            self.nas_service.delete_image(diff.primary_json_nas_path)
+            # Atualiza JSON
+            data_dict = self.data.row_to_dict(row)
+            merged = self.data.merge_paths(existing, paths) if paths else (existing or {})
+            merged.update(data_dict)
+            self.data.save(pid, merged)
 
-        nas_path = self._process_image(pid, diff.primary_excel_value,
-                                       self.image_service.primary_image_name(pid),
-                                       row_dict, label="principal")
-        if nas_path is None:
-            return None
+            # Atualiza índice de filtros
+            self.filter_index.upsert_product(
+                int(float(pid)), row, is_active=(status == "ativo")
+            )
 
-        return {"Caminho_Imagem": str(nas_path)}
+            stats["data_updated"] += 1
 
-    def _handle_secondary_image(
-        self, diff: ProductDiff, row_dict: dict,
-        sec: SecondaryImageDiff, secondary_cache: dict
-    ) -> dict:
-        pid = diff.product_id
-        slot = sec.slot
+            # Coleta para SharePoint
+            upd = {"Id_produto": pid, "Chave_Especial": chave}
+            if "Caminho_Imagem" in row:
+                upd["Caminho_Imagem"] = row.get("Caminho_Imagem", "")
+            sharepoint_updates.append(upd)
 
-        if sec.is_changed and sec.json_nas_path:
-            self.nas_service.delete_image(sec.json_nas_path)
-
-        nas_path = self._process_image(
-            pid, sec.excel_value,
-            self.image_service.secondary_image_name(pid, slot - 1),
-            row_dict, label=f"secundária {slot}"
-        )
-
-        if nas_path is None:
-            self.logger.warning(f"Id {pid}: falha na secundária slot {slot} — slot ignorado.")
-            return {}
-
-        secondary_cache[slot] = str(nas_path)
-        return {SECONDARY_EXCEL_COLS[slot]: str(nas_path)}
-
-    def _handle_secondary_deletion(
-        self, diff: ProductDiff, sec: SecondaryImageDiff, secondary_cache: dict
-    ) -> None:
-        pid = diff.product_id
-        self.logger.info(f"Id {pid}: deletando secundária slot {sec.slot}.")
-
-        if sec.json_nas_path:
-            self.nas_service.delete_image(sec.json_nas_path)
-
-        secondary_cache[sec.slot] = None  # sentinela: limpar no JSON
-
-    def _handle_nas_path_change(self, diff: ProductDiff, row_dict: dict) -> Optional[dict]:
-        pid = diff.product_id
-        self.logger.info(f"Id {pid}: movendo pasta NAS.")
-
-        new_path = self.nas_service.build_product_path(row_dict, pid)
-        current_path = self.nas_service.find_product_folder(pid)
-
-        if current_path is not None:
-            if not self.nas_service.move_product_folder(current_path, new_path):
-                self.logger.error(f"Id {pid}: falha ao mover pasta NAS.")
-                return None
-
-        primary_name = self.image_service.primary_image_name(pid)
-        return {"Caminho_Imagem": str(new_path / primary_name)}
-
-    # ------------------------------------------------------------------
-    # JSON
-    # ------------------------------------------------------------------
-
-    def _save_json(
-        self, diff: ProductDiff, row_dict: dict,
-        secondary_cache: dict, primary_nas: Optional[str] = None
-    ) -> None:
-        pid = diff.product_id
-        existing = self.json_service.load(pid) or {}
-
-        model = self.spreadsheet_service.row_to_model(row_dict)
-
-        model.caminho_imagem = primary_nas or existing.get("caminho_imagem")
-        model.caminho_bucket_principal = existing.get("caminho_bucket_principal")
-
-        for slot in SECONDARY_SLOTS:
-            cached = secondary_cache.get(slot, _ABSENT)
-            if cached is _ABSENT:
-                nas    = existing.get(SECONDARY_NAS_FIELDS[slot])
-                bucket = existing.get(SECONDARY_BUCKET_FIELDS[slot])
-            elif cached is None:
-                nas, bucket = None, None
-            else:
-                nas    = cached
-                bucket = existing.get(SECONDARY_BUCKET_FIELDS[slot])
-
-            setattr(model, SECONDARY_NAS_FIELDS[slot], nas)
-            setattr(model, SECONDARY_BUCKET_FIELDS[slot], bucket)
-
-        self.json_service.save(model, pid)
-        self.logger.info(f"Id {pid}: JSON salvo.")
-
-    # ------------------------------------------------------------------
-    # Processamento de imagem
-    # ------------------------------------------------------------------
-
-    def _process_image(
-        self, product_id: int, source_filename: str,
-        dest_filename: str, row_dict: dict, label: str
-    ) -> Optional[Path]:
-        self.logger.info(f"Id {product_id}: [{label}] '{source_filename}' → '{dest_filename}'")
-
-        source_filename_no_ext = Path(source_filename).stem
-        landing_path = self.image_service.file_exists_in_landing(source_filename_no_ext)
-        if landing_path is None:
-            self.logger.error(f"Id {product_id}: [{label}] '{source_filename}' não encontrado na landing.")
-            return None
-
-        temp_dir = Path(tempfile.mkdtemp())
-        try:
-            temp_img = temp_dir / dest_filename
-            if not self.image_service.process_image(landing_path, temp_img):
-                self.logger.error(f"Id {product_id}: [{label}] falha ao processar imagem.")
-                return None
-
-            nas_folder = self.nas_service.build_product_path(row_dict, product_id)
-            nas_path = self.nas_service.save_image(temp_img, nas_folder, dest_filename)
-            if nas_path is None:
-                self.logger.error(f"Id {product_id}: [{label}] falha ao salvar no NAS.")
-                return None
-
-            self._landing_paths_to_clean.append(landing_path)
-            self.logger.info(f"Id {product_id}: [{label}] salvo em {nas_path}")
-            return nas_path
-
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-    # ------------------------------------------------------------------
-    # Limpeza da landing
-    # ------------------------------------------------------------------
-
-    def _cleanup_landing(self) -> int:
-        seen: set[Path] = set()
-        count = 0
-        for path in self._landing_paths_to_clean:
-            if path in seen:
-                continue
-            seen.add(path)
-            try:
-                if path.exists():
-                    path.unlink()
-                    count += 1
-                    self.logger.info(f"[Cleanup] Removido da landing: {path.name}")
-                else:
-                    self.logger.debug(f"[Cleanup] Já não existe na landing: {path.name}")
-            except Exception as exc:
-                self.logger.error(f"[Cleanup] Erro ao remover '{path.name}': {exc}")
-        self.logger.info(f"[Cleanup] {count} arquivo(s) removido(s) da landing.")
-        return count
+        self.sp.update_image_paths(sharepoint_updates)

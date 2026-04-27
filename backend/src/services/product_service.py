@@ -29,10 +29,15 @@ class ProductService:
             product = self._load(json_path)
             if not product:
                 continue
+
             if not self._is_active(product):
                 continue
-            if allowed_ids is not None and int(product.get("id_produto", -1)) not in allowed_ids:
+
+            pid = int(json_path.stem)
+
+            if allowed_ids is not None and pid not in allowed_ids:
                 continue
+
             all_products.append(self._to_summary(product))
 
         total = len(all_products)

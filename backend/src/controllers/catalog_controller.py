@@ -1,9 +1,10 @@
-import shutil
+import time
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
+from models.catalog_models import ProcessCatalogResponse
 from services.catalog_service import CatalogService
 from services.startup_service import StartupService
 from utils.logger import setup_logger
@@ -18,42 +19,45 @@ ENDPOINT_NAME = "catalog_register"
 
 @router.post(
     "/register",
-    summary="Cadastrar produtos a partir de planilha",
+    response_model=ProcessCatalogResponse,
+    summary="Processa catálogo do SharePoint e retreina embeddings",
+    description="""
+        Fluxo completo de sincronização do catálogo:
+        
+        1. Lê planilha do SharePoint via Microsoft Graph API  
+        2. Compara com o mirror CSV para detectar mudanças  
+        3. Processa imagens novas/alteradas → output/ e thumbnail/  
+        4. Atualiza data/{id}.json para cada produto modificado  
+        5. Reconstrói/atualiza o índice de filtros (filters.json)  
+        6. Atualiza a planilha no SharePoint com os caminhos das imagens  
+        7. Salva o mirror CSV com o estado atual  
+        8. Retreina embeddings CLIP + ST + BM25 de forma atômica (zero-downtime):  
+        - Os novos embeddings são escritos em staging  
+        - Só após o treino completo os arquivos são trocados atomicamente  
+        - O app_state é atualizado em memória após o swap  
+        - Enquanto retreina, a API continua servindo os embeddings antigos  
+        """,
 )
-async def register_catalog(file: UploadFile = File(...)) -> JSONResponse:
-    if not file.filename.endswith((".xlsx", ".xlsm")):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Formato inválido: '{file.filename}'. Apenas .xlsx ou .xlsm são aceitos.",
-        )
-
-    logger = setup_logger(ENDPOINT_NAME)
-    logger.info(f"Planilha recebida: {file.filename}")
-
-    temp_path = _TEMP_UPLOAD_DIR / file.filename
+async def register_catalog(request: Request) -> JSONResponse:
+    logger = setup_logger("catalog_process")
+    t0 = time.time()
+ 
+    # 1. Processamento do catálogo (imagens, JSONs, filtros, SharePoint, mirror)
     try:
-        with temp_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        path = Path(temp_path)
-        if not path.exists():
-            raise HTTPException(status_code=422, detail=f"Arquivo não encontrado após upload: {temp_path}")
-
-        service = CatalogService(logger)
-        stats = service.process_spreadsheet(path)
-
-        logger.info("Processamento finalizado com sucesso.")
-        return JSONResponse(content={"status": "success", "stats": stats}, status_code=200)
-
-    except HTTPException:
-        raise
+        svc = CatalogService(logger, request.app.state.__dict__)
+        stats = svc.process()
     except Exception as exc:
-        logger.error(f"Erro inesperado: {exc}", exc_info=True)
+        logger.error(f"[Catalog] Falha crítica no processamento: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
-
-    finally:
-        if temp_path.exists():
-            temp_path.unlink()
+ 
+    elapsed = round(time.time() - t0, 2)
+    logger.info(f"[Catalog] Processo total: {elapsed}s")
+ 
+    return JSONResponse(content={
+        "status":          "success" if not stats.get("errors") else "partial",
+        "elapsed_seconds": elapsed,
+        **stats
+    })
 
 
 @router.post(
@@ -97,3 +101,23 @@ async def latest_log() -> FileResponse:
         filename=latest.name,
         headers={"Content-Disposition": f"attachment; filename={latest.name}"},
     )
+
+@router.get(
+    "/status",
+    summary="Estado atual dos embeddings em memória",
+)
+async def status(request: Request) -> JSONResponse:
+    state = request.app.state.__dict__
+ 
+    clip_emb = state.get("clip_embeddings")
+    text_emb = state.get("text_embeddings")
+    metadata = state.get("embeddings_metadata")
+ 
+    return JSONResponse(content={
+        "clip_embeddings_shape": list(clip_emb.shape) if clip_emb is not None else None,
+        "text_embeddings_shape": list(text_emb.shape) if text_emb is not None else None,
+        "metadata_count":        len(metadata) if metadata else 0,
+        "bm25_available":        state.get("bm25") is not None,
+        "clip_model_loaded":     state.get("clip_model") is not None,
+        "st_model_loaded":       state.get("st_model") is not None,
+    })

@@ -14,7 +14,6 @@ from PIL import Image
 
 from config.settings import settings
 
-
 def _minmax(scores: np.ndarray) -> np.ndarray:
     mn, mx = scores.min(), scores.max()
     if mx - mn < 1e-9:
@@ -25,7 +24,6 @@ def _tokenize(text: str) -> list[str]:
     text = unicodedata.normalize("NFD", text.lower())
     text = "".join(c for c in text if unicodedata.category(c) != "Mn")
     return re.findall(r'\b\w+\b', text)
-
 
 class SearchService:
 

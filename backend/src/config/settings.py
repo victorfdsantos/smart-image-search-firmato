@@ -25,6 +25,16 @@ def _resolve(path: str) -> Path:
     return p
 
 
+class SharePointSettings:
+    tenant_id:     str  = _cfg.get("sharepoint", "tenant_id")
+    client_id:     str  = _cfg.get("sharepoint", "client_id")
+    # Segredo lido de variável de ambiente — nunca do .ini
+    client_secret: str  = os.getenv("SHAREPOINT_CLIENT_SECRET", "")
+    host:          str  = _cfg.get("sharepoint", "host")
+    site_path:     str  = _cfg.get("sharepoint", "site_path")
+    file_name:     str  = _cfg.get("sharepoint", "file_name")
+    sheet_name:    str  = _cfg.get("sharepoint", "sheet_name")
+
 class GeneralSettings:
     landing_path: Path = _resolve(_cfg.get("general", "landing_path"))
     data_path: Path = _resolve(_cfg.get("general", "data_path"))
@@ -33,25 +43,55 @@ class GeneralSettings:
 
 
 class ImageSettings:
-    resize_width: int = _cfg.getint("image", "resize_width")
-    resize_height: int = _cfg.getint("image", "resize_height")
-    jpeg_quality: int = _cfg.getint("image", "jpeg_quality")
+    thumb_width:  int = _cfg.getint("image", "thumb_width")
+    thumb_height: int = _cfg.getint("image", "thumb_height")
+    output_width:  int = _cfg.getint("image", "output_width")
+    output_height: int = _cfg.getint("image", "output_height")
+    jpeg_quality:  int = _cfg.getint("image", "jpeg_quality")
     allowed_extensions: list[str] = [
-        e.strip().lower() for e in _cfg.get("image", "allowed_extensions").split(",")
+        e.strip().lower()
+        for e in _cfg.get("image", "allowed_extensions").split(",")
     ]
 
 
 class NasSettings:
     base_path: Path = _resolve(_cfg.get("nas", "base_path"))
-    organizer_columns: list[str] = [
-        c.strip() for c in _cfg.get("nas", "organizer_columns").split(",")
+ 
+    @property
+    def landing(self) -> Path:
+        """Imagens brutas colocadas pelo usuário."""
+        return self.base_path / "landing"
+ 
+    @property
+    def output(self) -> Path:
+        """Imagens processadas 1080×1080 (flat — sem subpastas)."""
+        return self.base_path / "output"
+ 
+    @property
+    def thumbnail(self) -> Path:
+        """Thumbnails 250×250 servidos na UI."""
+        return self.base_path / "thumbnail"
+ 
+    @property
+    def data(self) -> Path:
+        """JSONs por produto: {id}.json."""
+        return self.base_path / "data"
+ 
+    @property
+    def utils(self) -> Path:
+        """Arquivos auxiliares: filters.json, catalog_mirror.csv."""
+        return self.base_path / "utils"
+
+class ImageSettings:
+    thumb_width:  int = _cfg.getint("image", "thumb_width")
+    thumb_height: int = _cfg.getint("image", "thumb_height")
+    output_width:  int = _cfg.getint("image", "output_width")
+    output_height: int = _cfg.getint("image", "output_height")
+    jpeg_quality:  int = _cfg.getint("image", "jpeg_quality")
+    allowed_extensions: list[str] = [
+        e.strip().lower()
+        for e in _cfg.get("image", "allowed_extensions").split(",")
     ]
-
-
-class GcsSettings:
-    bucket_name: str = _cfg.get("gcs", "bucket_name")
-    credentials_path: Path = _resolve(_cfg.get("gcs", "credentials_path"))
-
 
 class HashSettings:
     hash_columns: list[str] = [
@@ -66,10 +106,12 @@ class EmbeddingsSettings:
 
 class Settings:
     general = GeneralSettings()
+    sharepoint = SharePointSettings()
     image = ImageSettings()
     nas = NasSettings()
-    gcs = GcsSettings()
     hash = HashSettings()
     embeddings = EmbeddingsSettings()
 
 settings = Settings()
+
+
