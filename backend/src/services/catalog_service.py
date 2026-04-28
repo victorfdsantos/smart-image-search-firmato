@@ -30,6 +30,7 @@ Garantia de zero-downtime:
 
 import logging
 from pathlib import Path
+import requests
 
 from config.settings import settings
 from services.filter_index_service import FilterIndexService
@@ -111,6 +112,27 @@ class CatalogService:
             if _clean(r.get("Id_produto")) and _clean(r.get("Status")).lower() == "ativo"
         ]
         stats["retrain_data_ids"] = delta.data_ids if not is_first_load else stats["retrain_clip_ids"]
+    
+        try:
+            if stats["retrain_clip_ids"] or stats["retrain_data_ids"]:
+                payload = {
+                    "image_ids": stats["retrain_clip_ids"],
+                    "data_ids": stats["retrain_data_ids"],
+                }
+
+                resp = requests.post(
+                    "http://ai:9000/training",
+                    json=payload,
+                    timeout=300
+                )
+
+                if resp.status_code == 200:
+                    self.logger.info(f"[Catalog] Training disparado com sucesso.")
+                else:
+                    self.logger.warning(f"[Catalog] Training falhou: {resp.status_code} - {resp.text}")
+
+        except Exception as exc:
+            self.logger.error(f"[Catalog] Erro ao chamar training: {exc}", exc_info=True)
 
         return stats
 
@@ -132,27 +154,56 @@ class CatalogService:
             chave = ImageService.generate_hash(row, _HASH_COLUMNS)
             row["Chave_Especial"] = chave
 
-            paths: dict = {}
-
-            # Imagem principal
+            # Imagem principal — se o produto tem imagem declarada,
+            # ela precisa existir e processar com sucesso; caso contrário
+            # o produto inteiro é pulado (sem .json, filtros ou SharePoint).
             img_col = _clean(row.get("Caminho_Imagem"))
             if img_col and _is_filename(img_col):
                 source = self.image.find_in_landing(img_col)
-                if source:
-                    fname = ImageService.primary_filename(pid)
-                    ok = self.image.process(source, fname)
-                    if ok:
-                        paths["caminho_output"]    = str(self.nas.output / fname)
-                        paths["caminho_thumbnail"] = str(self.nas.thumbnail / fname)
-                        row["Caminho_Imagem"] = paths["caminho_output"]
-                        stats["new_products"] += 1
-                    else:
-                        stats["image_errors"] += 1
-                else:
-                    self.logger.warning(f"[Catalog] Id {pid}: imagem principal não encontrada na landing.")
+                if not source:
+                    self.logger.warning(
+                        f"[Catalog] Id {pid}: imagem '{img_col}' não encontrada na landing — produto ignorado."
+                    )
                     stats["image_errors"] += 1
+                    continue
 
-            # Cria JSON
+                fname = ImageService.primary_filename(pid)
+                ok = self.image.process(source, fname)
+
+                if not ok:
+                    self.logger.warning(
+                        f"[Catalog] Id {pid}: falha ao processar imagem '{img_col}' — produto ignorado."
+                    )
+                    stats["image_errors"] += 1
+                    continue
+
+                # Valida se os arquivos realmente chegaram ao destino
+                output_path    = self.nas.output / fname
+                thumbnail_path = self.nas.thumbnail / fname
+                if not output_path.exists() or not thumbnail_path.exists():
+                    self.logger.warning(
+                        f"[Catalog] Id {pid}: process() ok mas arquivos ausentes em "
+                        f"output/thumbnail — produto ignorado."
+                    )
+                    stats["image_errors"] += 1
+                    continue
+
+                row["Caminho_Imagem"] = fname
+                paths = {
+                    "caminho_output":    str(output_path),
+                    "caminho_thumbnail": str(thumbnail_path),
+                }
+                stats["new_products"] += 1
+                try:
+                    source.unlink()
+                    self.logger.info(f"[Catalog] Imagem removida da landing: {source.name}")
+                except Exception as exc:
+                    self.logger.warning(f"[Catalog] Falha ao remover da landing: {source} | {exc}")
+            else:
+                # Produto sem imagem declarada — segue normalmente sem paths
+                paths = {}
+
+            # Cria JSON apenas se chegou até aqui
             data_dict = self.data.row_to_dict(row)
             data_dict.update(paths)
             self.data.save(pid, data_dict)
@@ -164,7 +215,7 @@ class CatalogService:
 
             # Coleta atualização para o SharePoint
             upd = {"Id_produto": pid, "Chave_Especial": chave}
-            if "Caminho_Imagem" in row:
+            if paths:
                 upd["Caminho_Imagem"] = row["Caminho_Imagem"]
             sharepoint_updates.append(upd)
 
@@ -206,29 +257,56 @@ class CatalogService:
             if pid in delta.new_products or pid in delta.image_changed:
                 img_col = _clean(row.get("Caminho_Imagem"))
                 if img_col and _is_filename(img_col):
-                    # Remove imagem antiga se existia
+                    source = self.image.find_in_landing(img_col)
+                    if not source:
+                        self.logger.warning(
+                            f"[Catalog] Id {pid}: imagem '{img_col}' não encontrada na landing — produto ignorado."
+                        )
+                        stats["image_errors"] += 1
+                        continue
+
+                    # Remove imagem antiga antes de processar a nova
                     if existing:
                         old_fname = ImageService.primary_filename(pid)
                         self.image.delete(old_fname)
-                    source = self.image.find_in_landing(img_col)
-                    if source:
-                        fname = ImageService.primary_filename(pid)
-                        ok = self.image.process(source, fname)
-                        if ok:
-                            paths["caminho_output"]    = str(self.nas.output / fname)
-                            paths["caminho_thumbnail"] = str(self.nas.thumbnail / fname)
-                            row["Caminho_Imagem"] = paths["caminho_output"]
-                            if is_new:
-                                stats["new_products"] += 1
-                            else:
-                                stats["images_updated"] += 1
-                        else:
-                            stats["image_errors"] += 1
-                    else:
-                        self.logger.warning(f"[Catalog] Id {pid}: imagem principal não encontrada.")
-                        stats["image_errors"] += 1
 
-            # Atualiza JSON
+                    fname = ImageService.primary_filename(pid)
+                    ok = self.image.process(source, fname)
+
+                    if not ok:
+                        self.logger.warning(
+                            f"[Catalog] Id {pid}: falha ao processar imagem '{img_col}' — produto ignorado."
+                        )
+                        stats["image_errors"] += 1
+                        continue
+
+                    # Valida se os arquivos realmente chegaram ao destino
+                    output_path    = self.nas.output / fname
+                    thumbnail_path = self.nas.thumbnail / fname
+                    if not output_path.exists() or not thumbnail_path.exists():
+                        self.logger.warning(
+                            f"[Catalog] Id {pid}: process() ok mas arquivos ausentes em "
+                            f"output/thumbnail — produto ignorado."
+                        )
+                        stats["image_errors"] += 1
+                        continue
+
+                    row["Caminho_Imagem"] = fname
+                    paths = {
+                        "caminho_output":    str(output_path),
+                        "caminho_thumbnail": str(thumbnail_path),
+                    }
+                    if is_new:
+                        stats["new_products"] += 1
+                    else:
+                        stats["images_updated"] += 1
+                    try:
+                        source.unlink()
+                        self.logger.info(f"[Catalog] Imagem removida da landing: {source.name}")
+                    except Exception as exc:
+                        self.logger.warning(f"[Catalog] Falha ao remover da landing: {source} | {exc}")
+
+            # Atualiza JSON apenas se chegou até aqui
             data_dict = self.data.row_to_dict(row)
             merged = self.data.merge_paths(existing, paths) if paths else (existing or {})
             merged.update(data_dict)
@@ -243,8 +321,8 @@ class CatalogService:
 
             # Coleta para SharePoint
             upd = {"Id_produto": pid, "Chave_Especial": chave}
-            if "Caminho_Imagem" in row:
-                upd["Caminho_Imagem"] = row.get("Caminho_Imagem", "")
+            if paths:
+                upd["Caminho_Imagem"] = row["Caminho_Imagem"]
             sharepoint_updates.append(upd)
 
         self.sp.update_image_paths(sharepoint_updates)
