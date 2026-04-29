@@ -1,328 +1,172 @@
-"""
-CatalogService — orquestra o pipeline completo de processamento do catálogo.
-
-Fluxo de PRIMEIRO CARREGAMENTO (sem mirror CSV):
-  1. Lê planilha via SharePoint API
-  2. Para cada produto ativo com imagem na landing:
-     a. Processa imagem → output/ e thumbnail/
-     b. Cria data/{id}.json
-  3. Constrói filters.json (índice de filtros)
-  4. Atualiza planilha no SharePoint com caminhos das imagens
-  5. Salva mirror CSV (espelho do estado atual)
-  6. Dispara retreinamento de embeddings (via EmbeddingService)
-
-Fluxo de RECARREGAMENTO (mirror CSV existente):
-  1. Lê planilha via SharePoint API
-  2. Compara com mirror CSV → DeltaResult
-  3. Aplica mudanças (novas imagens, dados alterados, produtos removidos)
-  4. Atualiza filters.json incrementalmente
-  5. Atualiza planilha no SharePoint (apenas linhas alteradas)
-  6. Salva mirror CSV atualizado
-  7. Dispara retreinamento de embeddings apenas para IDs alterados
-
-Garantia de zero-downtime:
-  O retreinamento de embeddings usa arquivos de staging que só são trocados
-  pelos de produção após o treino completo (swap atômico via os.replace).
-  O app_state é atualizado em memória apenas após o swap.
-  Enquanto o retreinamento ocorre, a API continua servindo os embeddings
-  antigos sem interrupção.
-"""
-
-import logging
+import json
 from pathlib import Path
-import requests
-
 from config.settings import settings
-from services.filter_index_service import FilterIndexService
-from services.image_service import ImageService
-from services.mirror_service import DeltaResult, MirrorService
-from services.product_data_service import ProductDataService
-from services.sharepoint_service import SharePointService
 
-_HASH_COLUMNS = [
-    "Id_produto", "Nome_Produto", "Marca", "Categoria_Principal", "Subcategoria"
-]
-
-
-def _clean(val) -> str:
-    if val is None:
-        return ""
-    s = str(val).strip()
-    return "" if s.lower() in ("nan", "none") else s
-
-
-def _is_filename(val: str) -> bool:
-    """True se o valor parece um nome de arquivo (sem barras)."""
-    return bool(val) and "/" not in val and "\\" not in val
-
+_HASH_COLUMNS = settings.hash.hash_columns
 
 class CatalogService:
 
-    def __init__(self, logger: logging.Logger, app_state: dict):
+    def __init__(self, logger, sp_repo, blob_repo, image_service, data_service, filter_service):
         self.logger = logger
-        self.app_state = app_state
-        self.sp = SharePointService(logger)
-        self.mirror = MirrorService(logger)
-        self.image = ImageService(logger)
-        self.data = ProductDataService(logger)
-        self.filter_index = FilterIndexService(logger)
-        self.nas = settings.nas
+        self.sp = sp_repo
+        self.blob = blob_repo
+        self.image = image_service
+        self.data = data_service
+        self.filter = filter_service
 
-    # ------------------------------------------------------------------
-    # Ponto de entrada
-    # ------------------------------------------------------------------
+    # --------------------------------------------------
+    # PROCESS
+    # --------------------------------------------------
 
     def process(self) -> dict:
         stats = {
-            "total_rows": 0,
-            "new_products": 0,
-            "images_updated": 0,
-            "data_updated": 0,
-            "removed": 0,
-            "image_errors": 0,
-            "retrain_clip_ids": [],
-            "retrain_data_ids": [],
-            "errors": [],
+            "processed": 0,
+            "skipped": 0,
+            "errors": 0,
+            "updated_ids": [],
         }
 
-        # 1. Lê planilha
-        rows = self.sp.read_catalog()
-        stats["total_rows"] = len(rows)
+        sharepoint_updates = []
+        landing_map = {}
 
-        # 2. Calcula delta
-        delta = self.mirror.compute_delta(rows)
+        hash_index = self._load_hash_index()
 
-        is_first_load = not bool(self.mirror.load_mirror())
+        rows = self.sp.list_rows()
 
-        if is_first_load:
-            self.logger.info("[Catalog] PRIMEIRO CARREGAMENTO detectado.")
-            self._process_first_load(rows, stats)
-        else:
-            self.logger.info("[Catalog] RECARREGAMENTO incremental.")
-            self._process_delta(delta, stats)
-
-        # 3. Garante que o mirror seja atualizado após processar
-        # (rows já contém os caminhos atualizados nas posições certas
-        #  porque atualizamos os dicts diretamente)
-        self.mirror.save_mirror(rows)
-
-        # 4. Retorna IDs para retreinamento (executado pelo controller)
-        stats["retrain_clip_ids"] = delta.image_ids if not is_first_load else [
-            _clean(r.get("Id_produto")) for r in rows
-            if _clean(r.get("Id_produto")) and _clean(r.get("Status")).lower() == "ativo"
-        ]
-        stats["retrain_data_ids"] = delta.data_ids if not is_first_load else stats["retrain_clip_ids"]
-    
-        try:
-            if stats["retrain_clip_ids"] or stats["retrain_data_ids"]:
-                payload = {
-                    "image_ids": stats["retrain_clip_ids"],
-                    "data_ids": stats["retrain_data_ids"],
-                }
-
-                resp = requests.post(
-                    "http://ai:9000/training",
-                    json=payload,
-                    timeout=300
-                )
-
-                if resp.status_code == 200:
-                    self.logger.info(f"[Catalog] Training disparado com sucesso.")
-                else:
-                    self.logger.warning(f"[Catalog] Training falhou: {resp.status_code} - {resp.text}")
-
-        except Exception as exc:
-            self.logger.error(f"[Catalog] Erro ao chamar training: {exc}", exc_info=True)
-
-        return stats
-
-    # ------------------------------------------------------------------
-    # Primeiro carregamento
-    # ------------------------------------------------------------------
-
-    def _process_first_load(self, rows: list[dict], stats: dict) -> None:
-        sharepoint_updates: list[dict] = []
+        blobs = self.blob.list_blobs("firmato-catalogo", "landing/")
+        blob_index = {}
+        for b in blobs:
+            key = Path(b).stem.lower()
+            blob_index.setdefault(key, []).append(b)
 
         for row in rows:
-            pid = _clean(row.get("Id_produto"))
-            if not pid:
-                continue
-
-            status = _clean(row.get("Status")).lower()
-
-            # Gera hash / chave especial
-            chave = ImageService.generate_hash(row, _HASH_COLUMNS)
-            row["Chave_Especial"] = chave
-
-            # Imagem principal — se o produto tem imagem declarada,
-            # ela precisa existir e processar com sucesso; caso contrário
-            # o produto inteiro é pulado (sem .json, filtros ou SharePoint).
-            img_col = _clean(row.get("Caminho_Imagem"))
-            if img_col and _is_filename(img_col):
-                source = self.image.find_in_landing(img_col)
-                if not source:
-                    self.logger.warning(
-                        f"[Catalog] Id {pid}: imagem '{img_col}' não encontrada na landing — produto ignorado."
-                    )
-                    stats["image_errors"] += 1
+            try:
+                pid = str(int(float(row.get("Id_produto"))))
+                if not pid:
                     continue
 
-                fname = ImageService.primary_filename(pid)
-                ok = self.image.process(source, fname)
+                new_hash = self.image.generate_hash(row, _HASH_COLUMNS)
 
-                if not ok:
-                    self.logger.warning(
-                        f"[Catalog] Id {pid}: falha ao processar imagem '{img_col}' — produto ignorado."
-                    )
-                    stats["image_errors"] += 1
+                if hash_index.get(pid) == new_hash:
+                    self.logger.debug(f"[Catalog] {pid}: sem alteração")
+                    stats["skipped"] += 1
                     continue
 
-                # Valida se os arquivos realmente chegaram ao destino
-                output_path    = self.nas.output / fname
-                thumbnail_path = self.nas.thumbnail / fname
-                if not output_path.exists() or not thumbnail_path.exists():
-                    self.logger.warning(
-                        f"[Catalog] Id {pid}: process() ok mas arquivos ausentes em "
-                        f"output/thumbnail — produto ignorado."
-                    )
-                    stats["image_errors"] += 1
+                img_raw = row.get("Caminho_Imagem")
+                if not img_raw:
                     continue
 
-                row["Caminho_Imagem"] = fname
-                paths = {
-                    "caminho_output":    str(output_path),
-                    "caminho_thumbnail": str(thumbnail_path),
-                }
-                stats["new_products"] += 1
-                try:
-                    source.unlink()
-                    self.logger.info(f"[Catalog] Imagem removida da landing: {source.name}")
-                except Exception as exc:
-                    self.logger.warning(f"[Catalog] Falha ao remover da landing: {source} | {exc}")
-            else:
-                # Produto sem imagem declarada — segue normalmente sem paths
-                paths = {}
+                base_name = Path(str(img_raw)).stem.lower()
 
-            # Cria JSON apenas se chegou até aqui
-            data_dict = self.data.row_to_dict(row)
-            data_dict.update(paths)
-            self.data.save(pid, data_dict)
+                candidates = blob_index.get(base_name)
 
-            # Atualiza índice de filtros
-            self.filter_index.upsert_product(
-                int(float(pid)), row, is_active=(status == "ativo")
-            )
+                if not candidates:
+                    self.logger.warning(f"[Catalog] {pid}: imagem não encontrada ({base_name}.*)")
+                    stats["errors"] += 1
+                    continue
 
-            # Coleta atualização para o SharePoint
-            upd = {"Id_produto": pid, "Chave_Especial": chave}
-            if paths:
-                upd["Caminho_Imagem"] = row["Caminho_Imagem"]
-            sharepoint_updates.append(upd)
+                # pega a primeira (ou pode priorizar extensão depois)
+                img_name = candidates[0]
 
-        # Rebuild completo do índice de filtros (garante consistência)
-        self.filter_index.build_from_rows(rows)
+                img_bytes = self.blob.download("firmato-catalogo", img_name)
 
-        # Atualiza SharePoint
-        self.sp.update_image_paths(sharepoint_updates)
+                output_bytes, thumb_bytes = self.image.process(img_bytes, pid)
 
-    # ------------------------------------------------------------------
-    # Recarregamento incremental
-    # ------------------------------------------------------------------
+                fname = f"{pid}.jpg"
 
-    def _process_delta(self, delta: DeltaResult, stats: dict) -> None:
-        sharepoint_updates: list[dict] = []
+                self.blob.upload("firmato-catalogo", f"output_staging/{fname}", output_bytes, "image/jpeg")
+                self.blob.upload("firmato-catalogo", f"thumbnail_staging/{fname}", thumb_bytes, "image/jpeg")
 
-        # — Produtos removidos —
-        for pid in delta.removed_ids:
-            self.data.mark_removed(pid)
-            self.filter_index.remove_product(int(float(pid)))
-            stats["removed"] += 1
+                product = self.data.row_to_model(row)
+                product.chave_especial = new_hash
+                product.caminho_output = f"output/{fname}"
+                product.caminho_thumbnail = f"thumbnail/{fname}"
 
-        all_changed = {
-            **delta.new_products,
-            **delta.image_changed,
-            **delta.data_changed,
+                self.blob.upload("firmato-catalogo",f"data_staging/{pid}.json",json.dumps(product.model_dump()).encode(),"application/json")
+
+                landing_map[pid] = img_name
+
+                sharepoint_updates.append({
+                    "Id_produto": pid,
+                    "Caminho_Imagem": fname,
+                    "Chave_Especial": new_hash
+                })
+
+                hash_index[pid] = new_hash
+
+                stats["processed"] += 1
+                stats["updated_ids"].append(pid)
+
+            except Exception as e:
+                self.logger.error(f"[Catalog] erro {row}: {e}", exc_info=True)
+                stats["errors"] += 1
+
+        stats["updated_ids"] = list(dict.fromkeys(stats["updated_ids"]))
+
+        return {
+            **stats,
+            "landing_map": landing_map,
+            "sharepoint_updates": sharepoint_updates,
+            "hash_index": hash_index,  # 🔥 NOVO
         }
 
-        for pid, row in all_changed.items():
-            status = _clean(row.get("Status")).lower()
-            existing = self.data.load(pid)
-            is_new = existing is None
-            paths: dict = {}
+    # --------------------------------------------------
+    # COMMIT
+    # --------------------------------------------------
 
-            chave = ImageService.generate_hash(row, _HASH_COLUMNS)
-            row["Chave_Especial"] = chave
+    def commit(self, updated_ids, landing_map, sharepoint_updates, hash_index):
+        try:
+            for pid in updated_ids:
+                fname = f"{pid}.jpg"
 
-            # Processa imagem principal se mudou
-            if pid in delta.new_products or pid in delta.image_changed:
-                img_col = _clean(row.get("Caminho_Imagem"))
-                if img_col and _is_filename(img_col):
-                    source = self.image.find_in_landing(img_col)
-                    if not source:
-                        self.logger.warning(
-                            f"[Catalog] Id {pid}: imagem '{img_col}' não encontrada na landing — produto ignorado."
-                        )
-                        stats["image_errors"] += 1
-                        continue
+                self._move("output_staging", "output", fname)
+                self._move("thumbnail_staging", "thumbnail", fname)
+                self._move("data_staging", "data", f"{pid}.json")
 
-                    # Remove imagem antiga antes de processar a nova
-                    if existing:
-                        old_fname = ImageService.primary_filename(pid)
-                        self.image.delete(old_fname)
+                original_name = landing_map.get(pid)
+                if original_name:
+                    self.blob.delete("firmato-catalogo", f"landing/{original_name}")
 
-                    fname = ImageService.primary_filename(pid)
-                    ok = self.image.process(source, fname)
+            if sharepoint_updates:
+                self.sp.update_rows(sharepoint_updates)
 
-                    if not ok:
-                        self.logger.warning(
-                            f"[Catalog] Id {pid}: falha ao processar imagem '{img_col}' — produto ignorado."
-                        )
-                        stats["image_errors"] += 1
-                        continue
+            self._save_hash_index(hash_index)
 
-                    # Valida se os arquivos realmente chegaram ao destino
-                    output_path    = self.nas.output / fname
-                    thumbnail_path = self.nas.thumbnail / fname
-                    if not output_path.exists() or not thumbnail_path.exists():
-                        self.logger.warning(
-                            f"[Catalog] Id {pid}: process() ok mas arquivos ausentes em "
-                            f"output/thumbnail — produto ignorado."
-                        )
-                        stats["image_errors"] += 1
-                        continue
+            self._clear_staging(updated_ids)
 
-                    row["Caminho_Imagem"] = fname
-                    paths = {
-                        "caminho_output":    str(output_path),
-                        "caminho_thumbnail": str(thumbnail_path),
-                    }
-                    if is_new:
-                        stats["new_products"] += 1
-                    else:
-                        stats["images_updated"] += 1
-                    try:
-                        source.unlink()
-                        self.logger.info(f"[Catalog] Imagem removida da landing: {source.name}")
-                    except Exception as exc:
-                        self.logger.warning(f"[Catalog] Falha ao remover da landing: {source} | {exc}")
+            rows = self.sp.list_rows()
+            self.filter.build(rows)
 
-            # Atualiza JSON apenas se chegou até aqui
-            data_dict = self.data.row_to_dict(row)
-            merged = self.data.merge_paths(existing, paths) if paths else (existing or {})
-            merged.update(data_dict)
-            self.data.save(pid, merged)
+        except Exception as e:
+            self.logger.error(f"[Catalog] Commit falhou: {e}", exc_info=True)
+            raise
 
-            # Atualiza índice de filtros
-            self.filter_index.upsert_product(
-                int(float(pid)), row, is_active=(status == "ativo")
-            )
+    # --------------------------------------------------
+    # HELPERS
+    # --------------------------------------------------
 
-            stats["data_updated"] += 1
+    def _move(self, src_container, dst_container, blob_name):
+        self.blob.copy(src_container, dst_container, blob_name)
 
-            # Coleta para SharePoint
-            upd = {"Id_produto": pid, "Chave_Especial": chave}
-            if paths:
-                upd["Caminho_Imagem"] = row["Caminho_Imagem"]
-            sharepoint_updates.append(upd)
+    def _clear_staging(self, ids):
+        for pid in ids:
+            fname = f"{pid}.jpg"
 
-        self.sp.update_image_paths(sharepoint_updates)
+            self.blob.delete("firmato-catalogo", f"output_staging/{fname}")
+            self.blob.delete("firmato-catalogo", f"thumbnail_staging/{fname}")
+            self.blob.delete("firmato-catalogo", f"data_staging/{pid}.json")
+        
+    def _load_hash_index(self):
+        try:
+            data = self.blob.download("firmato-catalogo", "utils/hash_index.json")
+            return json.loads(data)
+        except Exception:
+            return {}
+
+    def _save_hash_index(self, hash_index: dict):
+        self.blob.upload(
+            "utils",
+            "hash_index.json",
+            json.dumps(hash_index).encode(),
+            "application/json"
+        )

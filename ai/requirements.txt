@@ -14,3 +14,6 @@ numpy==1.26.4
 
 # Image
 pillow==11.2.1
+
+azure-storage-blob==12.19.1
+azure-identity==1.17.1

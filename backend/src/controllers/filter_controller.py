@@ -1,11 +1,10 @@
 """FilterController — endpoint para opções de filtro em cascata."""
 
-import json
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 from typing import Optional
 
-from services.filter_service import FilterService, FILTER_FIELDS, FILTER_LABELS
+from services.filter_service import FilterService, FILTER_FIELDS
 from utils.logger import setup_logger
 
 router = APIRouter(prefix="/filters", tags=["Filters"])
@@ -52,7 +51,6 @@ async def get_filter_options(
 
     return JSONResponse(content={
         "fields": FILTER_FIELDS,
-        "labels": FILTER_LABELS,
         "options": options,
         "active_filters": active_filters,
     })

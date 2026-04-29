@@ -15,6 +15,7 @@ services:
       - HF_HOME=/app/.cache/huggingface
       - CORS_ORIGINS=http://localhost,http://firmato.local
       - SHAREPOINT_CLIENT_SECRET=${SHAREPOINT_CLIENT_SECRET}
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING}
     volumes:
       - ./backend/src/config.ini:/app/src/config.ini:ro
       - ./backend/src/config:/app/src/config
@@ -65,6 +66,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - HF_HOME=/app/.cache/huggingface
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING}
     volumes:
       - ./ai/src/config.ini:/app/src/config.ini:ro
       - ./nas/data:/app/nas/data

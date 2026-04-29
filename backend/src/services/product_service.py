@@ -1,12 +1,8 @@
-"""ProductService — leitura e listagem de produtos a partir dos data/*.json."""
-
 import json
 import logging
 from pathlib import Path
 from typing import Optional
-
 from config.settings import settings
-
 
 class ProductService:
 

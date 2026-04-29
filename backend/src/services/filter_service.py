@@ -1,14 +1,7 @@
-"""FilterService — retorna opções de filtro em cascata a partir dos data/*.json."""
-
-import json
 import logging
 import re
-from pathlib import Path
-from typing import Optional
+from typing import Dict, List
 
-from config.settings import settings
-
-# Campos suportados como filtro, na ordem de exibição
 FILTER_FIELDS = [
     "marca",
     "categoria_principal",
@@ -19,99 +12,132 @@ FILTER_FIELDS = [
     "material_principal",
 ]
 
-FILTER_LABELS = {
-    "marca":               "Marca",
-    "categoria_principal": "Categoria Principal",
-    "subcategoria":        "Subcategoria",
-    "faixa_preco":         "Faixa de Preço",
-    "ambiente":            "Ambiente",
-    "forma":               "Forma",
-    "material_principal":  "Material Principal",
+# Mapeamento coluna SharePoint → campo interno
+_COL_TO_FIELD = {
+    "Marca":               "marca",
+    "Categoria_Principal": "categoria_principal",
+    "Subcategoria":        "subcategoria",
+    "Faixa_Preco":         "faixa_preco",
+    "Ambiente":            "ambiente",
+    "Forma":               "forma",
+    "Material_Principal":  "material_principal",
 }
 
-_INDEX_FILE = settings.nas.utils / "filters.json"
+def _clean(val) -> str:
+    if val is None:
+        return ""
+    s = str(val).strip()
+    return "" if s.lower() in ("nan", "none") else s
+
+def _split(raw: str) -> List[str]:
+    return [p.strip() for p in re.split(r"\s*/\s*", raw) if p.strip()]
+
 
 class FilterService:
+
     def __init__(self, logger: logging.Logger):
         self.logger = logger
+        self.index: Dict[str, Dict[str, List[int]]] = {f: {} for f in FILTER_FIELDS}
 
-    def get_options(self, active_filters: dict[str, list[str]]) -> dict[str, list[str]]:
-        self.logger.info(f"[Filter] active_filters={active_filters}")
+    # --------------------------------------------------
+    # BUILD (1x após load do catálogo)
+    # --------------------------------------------------
 
-        index = self._load()
+    def build(self, rows: List[dict]) -> None:
+        index = {f: {} for f in FILTER_FIELDS}
 
-        all_ids = set()
-        for field in index:
-            for ids in index[field].values():
-                all_ids.update(ids)
-
-        self.logger.debug(f"[Filter] total_ids={len(all_ids)}")
-
-        current_ids = all_ids
-
-        for field, selected_values in active_filters.items():
-            if not selected_values:
+        for row in rows:
+            if _clean(row.get("Status")).lower() != "ativo":
                 continue
 
-            field_ids = set()
-            for val in selected_values:
-                field_ids.update(index.get(field, {}).get(val, []))
+            pid_raw = _clean(row.get("Id_produto"))
+            if not pid_raw:
+                continue
 
-            self.logger.debug(
-                f"[Filter] field={field} selected={selected_values} matched_ids={len(field_ids)}"
-            )
+            try:
+                pid = int(float(pid_raw))
+            except:
+                continue
 
-            current_ids = current_ids.intersection(field_ids)
+            for col, field in _COL_TO_FIELD.items():
+                raw = _clean(row.get(col))
+                if not raw:
+                    continue
 
-            self.logger.debug(
-                f"[Filter] após '{field}' → current_ids={len(current_ids)}"
-            )
+                for val in _split(raw):
+                    index[field].setdefault(val, []).append(pid)
 
-        if not current_ids:
-            self.logger.warning("[Filter] Nenhum produto após aplicar filtros")
-
-        options = {}
-
+        # opcional: ordenar
         for field in index:
-            valid_values = []
+            for val in index[field]:
+                index[field][val].sort()
 
-            for val, ids in index[field].items():
-                if current_ids.intersection(ids):
-                    valid_values.append(val)
+        self.index = index
 
-            options[field] = sorted(valid_values)
-
-        self.logger.debug(
-            "[Filter] options_counts=" +
-            ", ".join(f"{f}={len(v)}" for f, v in options.items())
+        self.logger.info(
+            "[Filter] Index built: "
+            + ", ".join(f"{f}={len(index[f])}" for f in FILTER_FIELDS)
         )
 
-        return options
-    
-    def get_filtered_ids(self, active_filters: dict[str, list[str]]) -> set[int]:
-        index = self._load()
+    # --------------------------------------------------
+    # GET FILTER OPTIONS (cascata)
+    # --------------------------------------------------
 
-        all_ids = set()
-        for field in index:
-            for ids in index[field].values():
-                all_ids.update(ids)
+    def get_options(self, active_filters: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        current_ids = None
 
-        current_ids = all_ids
-
-        for field, selected_values in active_filters.items():
-            if not selected_values:
+        for field, values in active_filters.items():
+            if not values:
                 continue
 
-            field_ids = set()
-            for val in selected_values:
-                field_ids.update(index.get(field, {}).get(val, []))
+            ids = set()
+            for v in values:
+                ids.update(self.index.get(field, {}).get(v, []))
 
-            current_ids = current_ids.intersection(field_ids)
+            if current_ids is None:
+                current_ids = ids
+            else:
+                current_ids &= ids
 
-        return set(int(i) for i in current_ids)
-    
-    def _load(self) -> dict:
-        if not _INDEX_FILE.exists():
-            return {f: {} for f in FILTER_FIELDS}
-        with open(_INDEX_FILE, encoding="utf-8") as f:
-            return json.load(f)
+        if current_ids is None:
+            # nenhum filtro → retorna tudo
+            return {
+                f: sorted(self.index[f].keys())
+                for f in FILTER_FIELDS
+            }
+
+        # cascata
+        options = {}
+
+        for field in FILTER_FIELDS:
+            valid = []
+
+            for val, ids in self.index[field].items():
+                if current_ids.intersection(ids):
+                    valid.append(val)
+
+            options[field] = sorted(valid)
+
+        return options
+
+    # --------------------------------------------------
+    # GET IDS (para ProductService)
+    # --------------------------------------------------
+
+    def get_filtered_ids(self, active_filters: Dict[str, List[str]]) -> set[int]:
+        current_ids = None
+
+        for field, values in active_filters.items():
+            if not values:
+                continue
+
+            ids = set()
+            for v in values:
+                ids.update(self.index.get(field, {}).get(v, []))
+
+            if current_ids is None:
+                current_ids = ids
+            else:
+                current_ids &= ids
+
+        return current_ids or set()

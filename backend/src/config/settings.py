@@ -98,6 +98,8 @@ class HashSettings:
         c.strip() for c in _cfg.get("hash", "hash_columns").split(",")
     ]
 
+class AzureSettings:
+    connection_string: str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
 
 class EmbeddingsSettings:
     npy_path: Path = _resolve(_cfg.get("embeddings", "npy_path"))
@@ -111,6 +113,7 @@ class Settings:
     nas = NasSettings()
     hash = HashSettings()
     embeddings = EmbeddingsSettings()
+    azure = AzureSettings()
 
 settings = Settings()
 
